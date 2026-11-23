@@ -89,7 +89,7 @@ fun SleepTab(vm: Vm, navi: Navi) {
 private fun SleepHero(r: Report) {
     val t = r.totals
     val lvl = Norms.deepSleep(t.deepSleepPct, t.screenOffMs)
-    Section("Глубокий сон", sub = "доля времени с выключенным экраном, когда процессор спал", help = "deep_sleep", icon = Icons.Outlined.Bedtime) {
+    Section("Глубокий сон", sub = "доля времени без экрана и без зарядки, когда процессор спал", help = "deep_sleep", icon = Icons.Outlined.Bedtime) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             RingGauge((t.deepSleepPct / 100).toFloat(), lvl.color()) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -102,6 +102,7 @@ private fun SleepHero(r: Report) {
                 LevelPill(lvl, Norms.deepSleepWord(lvl).replaceFirstChar { it.uppercase() })
                 Spacer(Modifier.height(8.dp))
                 Text("Экран выключен ${Fmt.dur(t.screenOffMs)}", style = MaterialTheme.typography.bodyMedium)
+                if (t.plugMs > 0) Text("и ещё ${Fmt.dur(t.plugMs)} на зарядке — не в счёт", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (t.screenOffSuspendMs > 0) Text("из них во сне ${Fmt.dur(t.screenOffSuspendMs)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("Всего спал ${Fmt.dur(t.suspendMs)}, бодрствовал ${Fmt.dur(t.awakeMs)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -116,6 +117,7 @@ private fun SleepHero(r: Report) {
             )
         }
         when {
+            t.screenOffMs < Norms.MIN_OFF_MS && t.plugMs >= Norms.MIN_OFF_MS -> Explain("Телефон был на зарядке, а на зарядке он и не должен спать — это время в оценку сна не входит. Выберите период, когда телефон работал от батареи.")
             t.screenOffMs < Norms.MIN_OFF_MS -> Explain("Экран выключался меньше 10 минут — оценке сна пока рано доверять. Выберите период подлиннее или «Экран выкл.».")
             lvl == Lvl.GOOD -> Explain("Телефон спит как надо: фоновые пробуждения короткие и редкие.")
             else -> Explain("Телефон много бодрствует без экрана — это 50–200 мА вместо 5–20. Ниже: «Кто будит и держит» и «Почему не засыпал».")

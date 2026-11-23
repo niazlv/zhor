@@ -172,8 +172,10 @@ pub struct Totals {
     pub span_ms: u64,
     pub awake_ms: u64,
     pub suspend_ms: u64,
+    /// экран включён / выключен — только без зарядки: экран вкл. + экран выкл. + зарядка = весь период
     pub screen_on_ms: u64,
     pub screen_off_ms: u64,
+    /// глубокий сон в покое (экран выключен, без зарядки); на зарядке телефон и не обязан спать
     pub screen_off_suspend_ms: u64,
     pub plugged_ms: u64,
     /// по кулоновскому счётчику (только без зарядки)
@@ -553,7 +555,9 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
         tot.span_ms += span as u64;
         tot.awake_ms += (b.awake as f64 * ov) as u64;
         tot.suspend_ms += (b.susp as f64 * ov) as u64;
-        if b.scr {
+        if b.plug {
+            // на зарядке ни экран, ни сон в расход батареи не входят — считаем только как «зарядку»
+        } else if b.scr {
             tot.screen_on_ms += span as u64;
         } else {
             tot.screen_off_ms += span as u64;
@@ -588,7 +592,8 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
         tot.level_end = b.lvl1;
         tot.suspends += (b.sok as f64 * ov) as u64;
         tot.suspend_fails += (b.sfail as f64 * ov) as u64;
-        gpu_w += b.gpu * b.awake as f64 * ov;
+        // старые сборки ядра складывали оконные значения kgsl как счётчики — в их корзинах бывает > 1
+        gpu_w += b.gpu.clamp(0.0, 1.0) * b.awake as f64 * ov;
         gpu_ms += b.awake as f64 * ov;
         for p in &b.procs {
             let a = procs.entry((p.uid, p.n.clone(), p.h)).or_default();
@@ -1233,6 +1238,12 @@ fn system_work(snaps: &[&SysSnap], from: i64, to: i64, mas_per_ms: f64, pkgs: &B
     })
 }
 
+/// База для долей приложений: факт по счётчику, но не меньше суммы приложений. Факт считается только
+/// без зарядки, а расход приложений — за весь период; на зарядке иначе выходят доли в тысячи процентов.
+pub fn share_base(r: &Report) -> f64 {
+    r.totals.measured_mah.max(r.apps.iter().map(|a| a.mah).sum::<f64>())
+}
+
 /// Выводы: что главное за интервал, с оценкой «хорошо/плохо».
 fn insights(r: &Report) -> Vec<Insight> {
     let mut out = Vec::new();
@@ -1251,7 +1262,7 @@ fn insights(r: &Report) -> Vec<Insight> {
             .max_by_key(|w| w.count)
             .or_else(|| r.kernel.suspend_abort_reasons.first());
         let mut text = format!(
-            "С выключенным экраном телефон {} из {} провёл в глубоком сне ({:.0}%). ",
+            "Без зарядки с выключенным экраном телефон {} из {} провёл в глубоком сне ({:.0}%). ",
             fmt_dur(t.screen_off_suspend_ms),
             fmt_dur(t.screen_off_ms),
             t.deep_sleep_pct
@@ -1295,7 +1306,8 @@ fn insights(r: &Report) -> Vec<Insight> {
     // главный потребитель
     if let Some(a) = r.apps.first() {
         if a.mah > 0.5 {
-            let share = if t.measured_mah > 1.0 { format!(" — {:.0}% израсходованного", 100.0 * a.mah / t.measured_mah) } else { String::new() };
+            let base = share_base(r);
+            let share = if base > 1.0 { format!(" — {:.0}% израсходованного", 100.0 * a.mah / base) } else { String::new() };
             out.push(ins(
                 "info",
                 "apps",

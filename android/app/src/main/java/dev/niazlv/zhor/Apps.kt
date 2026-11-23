@@ -79,7 +79,7 @@ fun AppsTab(vm: Vm, navi: Navi) {
                 if (vm.error != null) item { ErrorCard("Отчёт не загрузился", vm.error!!) { vm.refresh() } } else item { SkeletonScreen() }
                 return@LazyColumn
             }
-            val total = r.totals.measuredMah.takeIf { it > 0 } ?: r.apps.sumOf { it.mah }
+            val total = shareBase(r)
             val wl = { a: App -> a.wakelocks.sumOf { it.ms } }
             val value: (App) -> Double = when (sort) {
                 1 -> { a -> a.cpuMahScreenOff }

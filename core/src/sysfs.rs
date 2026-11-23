@@ -249,9 +249,18 @@ impl SuspendReader {
 
 /// Загрузка GPU (Adreno kgsl): (busy, total) из gpubusy.
 pub fn gpu_busy() -> Option<(u64, u64)> {
+    // kgsl отдаёт «занят / всего» за последнее окно (~1 с), а не накопительные счётчики: разность двух
+    // чтений даёт мусор (сотни процентов). Складываем окна в свои накопительные суммы — шаг берёт
+    // разность, как у прочих счётчиков, и получает долю текущего окна. Окно без работы (GPU спит,
+    // всего = 0) идёт за единицу простоя, чтобы разность не обнулялась.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BUSY: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
     let s = util::read_str("/sys/class/kgsl/kgsl-3d0/gpubusy")?;
     let mut it = s.split_whitespace();
-    let a = it.next()?.parse().ok()?;
-    let b = it.next()?.parse().ok()?;
-    Some((a, b))
+    let a: u64 = it.next()?.parse().ok()?;
+    let b: u64 = it.next()?.parse().ok()?;
+    let total = b.max(1);
+    let busy = a.min(total);
+    Some((BUSY.fetch_add(busy, Ordering::Relaxed) + busy, TOTAL.fetch_add(total, Ordering::Relaxed) + total))
 }

@@ -1,5 +1,11 @@
 package dev.niazlv.zhor
 
+/**
+ * База для долей приложений: факт по счётчику, но не меньше суммы приложений. Факт считается только
+ * без зарядки, а расход приложений — за весь период; на зарядке иначе выходят доли в тысячи процентов.
+ */
+fun shareBase(r: Report): Double = maxOf(r.totals.measuredMah, r.apps.sumOf { it.mah })
+
 /** Оценки чисел по нормам из docs/api.md и «Как читать». */
 object Norms {
     /** Слишком мало выключенного экрана, чтобы судить о сне. */
@@ -126,12 +132,12 @@ object Insights {
         if (sleep == Lvl.BAD || sleep == Lvl.WARN) {
             val ws = r.kernel.wakeupSources.firstOrNull()
             val text = buildString {
-                append("С выключенным экраном телефон спал только ${Fmt.pctRaw(t.deepSleepPct)} % времени (норма — больше 90 %).")
+                append("Без зарядки с выключенным экраном телефон спал только ${Fmt.pctRaw(t.deepSleepPct)} % времени (норма — больше 90 %).")
                 if (ws != null) append(" Чаще всех будил «${ws.name}»: ${Fmt.times(ws.wakeups)}, держал ${Fmt.dur(ws.heldMs)}.")
             }
             out += Insight(if (sleep == Lvl.BAD) "bad" else "warn", "Телефон плохо спит", text, null, "sleep")
         } else if (sleep == Lvl.GOOD) {
-            out += Insight("good", "Телефон хорошо спит", "С выключенным экраном ${Fmt.pctRaw(t.deepSleepPct)} % времени в глубоком сне.", null, "sleep")
+            out += Insight("good", "Телефон хорошо спит", "Без зарядки с выключенным экраном ${Fmt.pctRaw(t.deepSleepPct)} % времени в глубоком сне.", null, "sleep")
         }
         val drain = Norms.drainOff(t.pctPerHourOff, t.screenOffMs)
         if (drain == Lvl.BAD) {
@@ -150,7 +156,8 @@ object Insights {
             )
         }
         r.apps.firstOrNull()?.let { a ->
-            val share = if (t.measuredMah > 0) " — ${Fmt.pctRaw(100 * a.mah / t.measuredMah)} % израсходованного" else ""
+            val base = shareBase(r)
+            val share = if (base > 0) " — ${Fmt.pctRaw(100 * a.mah / base)} % израсходованного" else ""
             out += Insight("info", "Больше всех — ${a.label}", "${Fmt.mah(a.mah)} мА·ч$share. ${a.why.firstOrNull() ?: ""}", a.uid, "apps")
         }
         if (Norms.other(t.otherMah, t.measuredMah) == Lvl.BAD) {

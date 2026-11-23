@@ -22,13 +22,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
 /** Энергия процесса zhord за период отчёта — честная цена самого профилировщика. */
-data class SelfCost(val mah: Double, val mahOff: Double, val cpuMs: Long, val avgMa: Double, val sharePct: Double)
+data class SelfCost(val mah: Double, val mahOff: Double, val cpuMs: Long, val avgMa: Double, val sharePct: Double, val base: Double)
 
 fun selfCost(r: Report): SelfCost? {
     val p = r.apps.firstOrNull { it.uid == 0 }?.processes?.firstOrNull { it.name == "zhord" } ?: return null
     val hours = r.totals.spanMs / 3_600_000.0
-    val share = if (r.totals.measuredMah > 0) 100 * p.mah / r.totals.measuredMah else 0.0
-    return SelfCost(p.mah, p.mahScreenOff, p.cpuMs, if (hours > 0) p.mah / hours else 0.0, share)
+    val base = shareBase(r)
+    val share = if (base > 0) 100 * p.mah / base else 0.0
+    return SelfCost(p.mah, p.mahScreenOff, p.cpuMs, if (hours > 0) p.mah / hours else 0.0, share, base)
 }
 
 fun selfCostLvl(sharePct: Double): Lvl = when {
@@ -52,7 +53,7 @@ fun SelfCostCard(vm: Vm, s: CoreStatus?, liveMa: Double?, liveMode: Boolean = fa
                 MetricTile("Ток zhord", Fmt.d1(c.avgMa), Modifier.weight(1f), unit = "мА", sub = "в среднем за период")
                 MetricTile(
                     "Доля расхода", if (c.sharePct in 0.0..0.05) "<0,1" else Fmt.d1(c.sharePct), Modifier.weight(1f), unit = "%",
-                    lvl = selfCostLvl(c.sharePct), sub = "${Fmt.mah(c.mah)} из ${Fmt.mah(r.totals.measuredMah)} мА·ч",
+                    lvl = selfCostLvl(c.sharePct), sub = "${Fmt.mah(c.mah)} из ${Fmt.mah(c.base)} мА·ч",
                 )
             }
             Spacer(Modifier.height(6.dp))
