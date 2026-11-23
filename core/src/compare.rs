@@ -78,6 +78,19 @@ fn bg_mode(pkg: &str, user: &str) -> Option<String> {
     util::run_cmd("cmd", &["appops", "get", "--user", user, pkg, "RUN_ANY_IN_BACKGROUND"], 10_000).and_then(|t| parse_appop(&t))
 }
 
+/// То же с повторами: под нагрузкой `cmd appops` иногда не отвечает — «не прочитался» не значит «не ограничено».
+fn bg_mode_sure(pkg: &str, user: &str) -> Option<String> {
+    for i in 0..3 {
+        if let Some(m) = bg_mode(pkg, user) {
+            return Some(m);
+        }
+        if i < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+        }
+    }
+    None
+}
+
 /// Можно ли работать в фоне (appop RUN_ANY_IN_BACKGROUND) и корзина ожидания приложения.
 pub fn app_state(pkg: &str, uid: Option<u32>) -> Value {
     if !valid_pkg(pkg) {
@@ -121,6 +134,81 @@ pub fn act(dir: &Path, pkg: &str, uid: Option<u32>, action: &str) -> Value {
         let _ = writeln!(f, "{}", serde_json::to_string(&a).unwrap_or_default());
     }
     json!({"ok": ok, "action": a, "state": app_state(pkg, uid)})
+}
+
+/// Весь журнал действий по порядку (без отсечки по сроку — по нему возвращаются ограничения).
+fn all_actions(dir: &Path) -> Vec<Action> {
+    let mut v: Vec<Action> = std::fs::File::open(dir.join("actions.jsonl"))
+        .map(|f| BufReader::new(f).lines().map_while(Result::ok).filter_map(|l| serde_json::from_str::<Action>(&l).ok()).collect())
+        .unwrap_or_default();
+    v.sort_by_key(|a| a.t);
+    v
+}
+
+/// Ограничение, которое поставил Жор и которое до сих пор действует.
+#[derive(Debug, Clone, Serialize)]
+pub struct Restr {
+    pub pkg: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// когда ограничил
+    pub since: i64,
+    /// режим работы в фоне до Жора — в него и вернём
+    pub prev: String,
+}
+
+/// Из журнала: кого Жор ограничил и не вернул. Первое «ограничить» серии хранит режим до Жора; если и тогда
+/// фон был запрещён (ignore/deny) — ограничение не наше. Текущий режим не проверяется (см. [restricted]).
+fn claimed(all: &[Action]) -> Vec<Restr> {
+    let mut state: std::collections::BTreeMap<(String, Option<u32>), Option<Restr>> = std::collections::BTreeMap::new();
+    for a in all.iter().filter(|a| a.ok) {
+        let e = state.entry((a.pkg.clone(), a.uid)).or_insert(None);
+        match a.action.as_str() {
+            "restrict" if e.is_none() => {
+                let prev = a.prev.clone().unwrap_or_else(|| "allow".into());
+                *e = Some(Restr { pkg: a.pkg.clone(), uid: a.uid, since: a.t, prev });
+            }
+            "unrestrict" => *e = None,
+            _ => {}
+        }
+    }
+    state.into_values().flatten().filter(|r| r.prev != "ignore" && r.prev != "deny").collect()
+}
+
+/// Кого Жор ограничил и кто до сих пор ограничен. Если режим с тех пор поменяли (сами, в настройках Android,
+/// или приложение переустановили) — это уже не наше, не трогаем.
+pub fn restricted(dir: &Path) -> Vec<Restr> {
+    claimed(&all_actions(dir)).into_iter().filter(|r| bg_mode(&r.pkg, &user_of(r.uid)).as_deref() == Some("ignore")).collect()
+}
+
+/// Вернуть всё, что ограничил Жор, в режим до него. Каждый возврат пишется в журнал как «unrestrict».
+pub fn revert_all(dir: &Path) -> Value {
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    // не наше уже: режим поменяли с тех пор (сами, в настройках, переустановкой) — для журнала
+    let mut skipped = Vec::new();
+    for r in claimed(&all_actions(dir)) {
+        let user = user_of(r.uid);
+        // режим не прочитался — по журналу ограничение наше: снимаем
+        let now = bg_mode_sure(&r.pkg, &user);
+        if now.is_some() && now.as_deref() != Some("ignore") {
+            skipped.push(json!({"pkg": r.pkg, "uid": r.uid, "mode": now}));
+            continue;
+        }
+        let mode = match r.prev.as_str() {
+            m @ ("allow" | "foreground" | "default") => m,
+            _ => "allow",
+        };
+        let out = util::run_cmd("cmd", &["appops", "set", "--user", &user, &r.pkg, "RUN_ANY_IN_BACKGROUND", mode], 10_000).unwrap_or_default();
+        let after = bg_mode_sure(&r.pkg, &user);
+        let ok = after.as_deref() == Some(mode) || (mode == "allow" && after.is_some() && after.as_deref() != Some("ignore"));
+        let a = Action { t: util::real_ms(), pkg: r.pkg.clone(), uid: r.uid, action: "unrestrict".into(), ok, prev: Some("ignore".into()), out: format!("вернуть всё: {}", out.trim()).chars().take(300).collect() };
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("actions.jsonl")) {
+            let _ = writeln!(f, "{}", serde_json::to_string(&a).unwrap_or_default());
+        }
+        if ok { done.push(r) } else { failed.push(r) }
+    }
+    json!({"ok": failed.is_empty(), "reverted": done, "failed": failed, "skipped": skipped})
 }
 
 /// Журнал действий, новые первыми; `uid` — только этого приложения.
@@ -310,6 +398,33 @@ mod tests {
         assert_eq!(parse_appop(""), None);
         assert!(!valid_pkg("com.x; rm"));
         assert!(valid_pkg("com.example.app_2"));
+    }
+
+    fn act(t: i64, pkg: &str, action: &str, prev: Option<&str>, ok: bool) -> Action {
+        Action { t, pkg: pkg.into(), uid: Some(10_100), action: action.into(), ok, prev: prev.map(String::from), out: String::new() }
+    }
+
+    #[test]
+    fn claimed_follows_journal() {
+        let all = vec![
+            // ограничили, разрешили, снова ограничили: вернуть в режим до первого ограничения серии
+            act(1, "com.a", "restrict", Some("allow"), true),
+            act(2, "com.a", "unrestrict", Some("ignore"), true),
+            act(3, "com.a", "restrict", Some("allow"), true),
+            act(4, "com.a", "restrict", Some("ignore"), true),
+            // было запрещено ещё до Жора — не наше
+            act(5, "com.b", "restrict", Some("ignore"), true),
+            // не вышло — не считается
+            act(6, "com.c", "restrict", Some("allow"), false),
+            // остановка — не ограничение
+            act(7, "com.d", "stop", Some("allow"), true),
+            // ограничили и вернули
+            act(8, "com.e", "restrict", Some("allow"), true),
+            act(9, "com.e", "unrestrict", Some("ignore"), true),
+        ];
+        let c = claimed(&all);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!((c[0].pkg.as_str(), c[0].since, c[0].prev.as_str()), ("com.a", 3, "allow"));
     }
 
     #[test]

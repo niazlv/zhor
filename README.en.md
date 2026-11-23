@@ -204,6 +204,19 @@ shows up in the report, and the app has a "cost of Zhor itself" card.
 - The core accepts requests from root only (`SO_PEERCRED` check) and writes exports only to the app's
   folder and shared storage.
 
+## What Zhor changes in the system
+
+Only what you tapped yourself, and all of it can be undone:
+
+- **Stop** is one-off, like "Force stop" in app settings: the app comes back as soon as it is opened.
+- **Restrict background** is Android's standard restriction (`RUN_ANY_IN_BACKGROUND`); lift it with the button on the app
+  card, with «Вернуть всё» (undo all) on the Watchdog screen, or in the app's battery settings. It restores the mode the app had
+  before Zhor and leaves alone anything you changed since. Without the app: `zhord revert-all`.
+- **Detailed Android history** is only on if you enable it; Android also resets it on reboot.
+- **Uninstalled the app?** Within 10 minutes the core lifts its restrictions, turns detailed history off, removes its
+  autostart script and stops. Records stay in `/data/adb/zhor` — delete them in the app before uninstalling, or by hand.
+- **Revoking the app's root is not enough**: the core already runs as root and keeps going. Undo all or uninstall the app first.
+
 ## Project layout
 
 ```text
@@ -213,7 +226,8 @@ core/                 zhord, the Rust core
   src/report.rs       report: apps, processes, threads, insights, timeline
   src/history.rs      Android event history
   src/watch.rs        watchdog: idle rules, alerts, delivery to the app
-  src/compare.rs      app actions and before/after comparison
+  src/compare.rs      app actions, undo all, before/after comparison
+  src/guard.rs        app uninstalled — lift restrictions, remove autostart
   src/sys/            batterystats (proto, usage, checkin), suspend, binder/looper
   src/explain.rs      "what is this and why" dictionary (Russian)
 android/              the app, Kotlin + Jetpack Compose

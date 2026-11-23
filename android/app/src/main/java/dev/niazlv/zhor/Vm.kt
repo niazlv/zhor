@@ -83,6 +83,23 @@ class Vm(app: Application) : AndroidViewModel(app) {
     val actionLog = mutableStateMapOf<Int, List<ActionRec>>()
     val cmps = mutableStateMapOf<String, Res<Comparison>>()
     var acting by mutableStateOf(false)
+    /** Что ограничил Жор и что до сих пор ограничено (null — ещё не загружено или ядро старое). */
+    var restricted by mutableStateOf<List<Restr>?>(null)
+
+    /** Окно «нужны уведомления» в этом запуске уже было (закрыли «назад» — до следующего запуска). */
+    var notifPromptShown by mutableStateOf(false)
+
+    /** Окно «нужны уведомления» — не чаще раза в 3 дня после «Не сейчас». */
+    fun notifPromptDue(): Boolean = System.currentTimeMillis() - prefs.getLong("notif_prompt_later", 0) > 3 * 86_400_000L
+
+    fun notifPromptLater() {
+        prefs.edit().putLong("notif_prompt_later", System.currentTimeMillis()).apply()
+    }
+
+    /** Запрос разрешения уже был: после двух отказов Android его больше не показывает. */
+    var notifAsked: Boolean
+        get() = prefs.getBoolean("notif_asked", false)
+        set(v) = prefs.edit().putBoolean("notif_asked", v).apply()
 
     private var liveJob: Job? = null
 
@@ -570,6 +587,36 @@ class Vm(app: Application) : AndroidViewModel(app) {
                 acting = false
             }
             loadActions(uid)
+            loadActions(null)
+            loadRestricted()
+        }
+    }
+
+    fun loadRestricted() {
+        if (fileMode || !ready) return
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { core.restricted() } }.onSuccess { restricted = it }
+        }
+    }
+
+    fun revertAll() {
+        if (acting) return
+        acting = true
+        viewModelScope.launch {
+            try {
+                val (ok, bad) = withContext(Dispatchers.IO) { core.revertAll() }
+                toast = when {
+                    bad > 0 -> "Вернул $ok, не вышло: $bad — снимите ограничение в настройках батареи приложения"
+                    ok == 0 -> "Возвращать нечего"
+                    else -> "Вернул всё: $ok ${Fmt.plural(ok.toLong(), "приложению", "приложениям", "приложениям")} снова разрешена работа в фоне"
+                }
+            } catch (e: Exception) {
+                toast = "Не вышло: ${e.message}"
+            } finally {
+                acting = false
+            }
+            appStates.clear()
+            loadRestricted()
             loadActions(null)
         }
     }

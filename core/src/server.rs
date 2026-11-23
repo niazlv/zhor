@@ -220,6 +220,9 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
         });
     }
 
+    // приложение удалили — вернуть ограничения, убрать автозапуск и остановиться
+    let mut guard = crate::guard::Guard::new(&dir);
+
     // цикл сбора
     loop {
         if STOP.load(Ordering::SeqCst) {
@@ -245,6 +248,18 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
                 g.interval_ms()
             }
         };
+        if guard.check(util::real_ms()) {
+            let full = d.lock().map(|g| g.config.full_history).unwrap_or(false);
+            log(&dir, "приложение Жор удалено — убираю за собой");
+            let (lines, done) = guard.cleanup(&dir, full);
+            for line in lines {
+                log(&dir, &format!("  {line}"));
+            }
+            if done {
+                STOP.store(true, Ordering::SeqCst);
+                continue;
+            }
+        }
         // спим кусками, чтобы быстро реагировать на stop
         let mut left = iv;
         while left > 0 && !STOP.load(Ordering::SeqCst) {
@@ -440,6 +455,12 @@ fn handle(conn: UnixStream, d: Arc<Mutex<Daemon>>, dir: PathBuf) {
                 let (pkg, action) = (raw["pkg"].as_str().unwrap_or(""), raw["action"].as_str().unwrap_or(""));
                 let r = crate::compare::act(&dir, pkg, uid, action);
                 log(&dir, &format!("действие {action} {pkg}: {}", if r["ok"].as_bool().unwrap_or(false) { "ок" } else { "не вышло" }));
+                r.to_string()
+            }
+            "restricted" => json!({"restricted": crate::compare::restricted(&dir)}).to_string(),
+            "revert_all" => {
+                let r = crate::compare::revert_all(&dir);
+                log(&dir, &format!("вернуть всё: {} возвращено, {} не вышло", r["reverted"].as_array().map(|a| a.len()).unwrap_or(0), r["failed"].as_array().map(|a| a.len()).unwrap_or(0)));
                 r.to_string()
             }
             "actions" => {

@@ -39,5 +39,7 @@ class MainActivity : ComponentActivity() {
         // при возврате в приложение — свежий отчёт без нового снимка batterystats (дёшево)
         if (resumedOnce) vm.refresh()
         resumedOnce = true
+        // вернулись из настроек уведомлений — окно «нужны уведомления» и экран сторожа увидят новое состояние
+        vm.refreshNotifState()
     }
 }

@@ -486,7 +486,8 @@ impl Daemon {
     /// Очистка записей (все / раньше before). → (файлов, байт)
     pub fn prune(&mut self, before: Option<i64>) -> (u64, u64) {
         let (mut n, mut freed) = self.store.prune(before);
-        for name in ["snaps.jsonl", "events.jsonl", "actions.jsonl"] {
+        // actions.jsonl не чистим: по нему Жор возвращает ограничения фона, которые поставил
+        for name in ["snaps.jsonl", "events.jsonl"] {
             let p = self.dir.join(name);
             let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
             if size == 0 {

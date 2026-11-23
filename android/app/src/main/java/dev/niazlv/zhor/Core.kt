@@ -179,6 +179,18 @@ class Core(ctx: Context) {
         return o.optBoolean("ok") to o.optJSONObject("state")?.let { AppState.parse(it) }
     }
 
+    /** Что ограничил Жор и что до сих пор ограничено. */
+    fun restricted(): List<Restr> {
+        val arr = query(JSONObject().put("cmd", "restricted")).optJSONArray("restricted") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let { o -> Restr.parse(o) } }
+    }
+
+    /** Вернуть всё, что ограничил Жор. → (возвращено, не вышло) */
+    fun revertAll(): Pair<Int, Int> {
+        val o = query(JSONObject().put("cmd", "revert_all"))
+        return (o.optJSONArray("reverted")?.length() ?: 0) to (o.optJSONArray("failed")?.length() ?: 0)
+    }
+
     fun actions(uid: Int? = null): List<ActionRec> {
         val q = JSONObject().put("cmd", "actions")
         if (uid != null) q.put("uid", uid)

@@ -23,6 +23,7 @@ mod sysfs;
 mod util;
 mod watch;
 mod compare;
+mod guard;
 
 use serde_json::json;
 use std::path::PathBuf;
@@ -37,6 +38,7 @@ fn usage() -> ! {
          \n  zhord stop | status | live\
          \n  zhord report [since_unplug|screen_off|charge|1h|3h|6h|12h|24h|48h|all] [--json] [--fresh] [--uid N]\
          \n  zhord alerts                тревоги сторожа\
+         \n  zhord restricted | revert-all   что ограничил Жор / вернуть всё (работает и без демона)\
          \n  zhord alert-test            проверочная тревога в приложение\
          \n  zhord watch-check [--days N] [--fast]  прогон правил сторожа по записям (только чтение)\
          \n  zhord compare [rest | action МС] [--uid N]   сравнение покоя до/после\
@@ -248,6 +250,16 @@ fn main() {
                 cost = cost.max(w.last_cost_us);
             }
             println!("\nпроверок {n}, самая долгая {:.1} мс", cost as f64 / 1000.0);
+        }
+        "restricted" | "revert-all" => {
+            // работает и без демона (например, когда приложение уже удалено, а ядро остановлено)
+            let dir = PathBuf::from(arg_val(&args, "--dir").unwrap_or_else(|| DEFAULT_DIR.into()));
+            let v = if args[1] == "revert-all" {
+                compare::revert_all(&dir)
+            } else {
+                json!({"restricted": compare::restricted(&dir)})
+            };
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         }
         "alert-test" | "compare" => {
             let req = if args[1] == "alert-test" {

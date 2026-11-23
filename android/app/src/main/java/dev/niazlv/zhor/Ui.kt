@@ -35,6 +35,7 @@ import androidx.compose.material.icons.outlined.Bedtime
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
@@ -200,8 +201,31 @@ private val TABS = listOf(
     Tab("Сейчас", "ток батареи в реальном времени", Icons.Outlined.Bolt, Icons.Filled.Bolt),
 )
 
+/** Сторож включён, а уведомления запрещены: окно «нужны уведомления» — раз за запуск и не чаще раза в 3 дня. */
+@Composable
+private fun NotifPrompt(vm: Vm) {
+    val watchOn = vm.alerts.value()?.watch == true
+    if (!vm.ready || vm.fileMode || vm.report == null || !watchOn || vm.notifAllowed || vm.notifPromptShown || !vm.notifPromptDue()) return
+    val ask = rememberNotifRequest(vm)
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = { vm.notifPromptShown = true },
+        icon = { Icon(Icons.Outlined.NotificationsActive, null) },
+        title = { Text("Сторожу нужны уведомления") },
+        text = {
+            Text(
+                "Сторож присылает уведомление в тот момент, когда телефон не спит, батарея тает в покое или приложение " +
+                    "работает в фоне. Без уведомлений тревоги будут только копиться в списке внутри Жора.\n\n" +
+                    "Выключить сторожа можно в настройках → «Сторож и «до/после»».",
+            )
+        },
+        confirmButton = { TextButton(onClick = { vm.notifPromptShown = true; ask() }) { Text("Включить") } },
+        dismissButton = { TextButton(onClick = { vm.notifPromptShown = true; vm.notifPromptLater() }) { Text("Не сейчас") } },
+    )
+}
+
 @Composable
 private fun Home(vm: Vm, navi: Navi) {
+    NotifPrompt(vm)
     var tab by rememberSaveable { mutableIntStateOf(0) }
     BackHandler(tab != 0) { tab = 0 }
     val holder = rememberSaveableStateHolder()

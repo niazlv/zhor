@@ -59,6 +59,8 @@
  "device": {"profile": "...", "battery_full_mah": "4737", "battery_design_mah": "5410", "scan_cost_us": "..."},
  "totals": {
    "span_ms","awake_ms","suspend_ms","screen_on_ms","screen_off_ms","screen_off_suspend_ms","plugged_ms",
+                              // (0.6) screen_on/screen_off/screen_off_suspend — только без зарядки:
+                              // screen_on_ms + screen_off_ms + plugged_ms = span_ms
    "measured_mah",            // по кулоновскому счётчику, только без зарядки — ФАКТ
    "measured_avg_ma","measured_screen_on_ma","measured_screen_off_ma","measured_source",
    "model_cpu_mah","model_cpu_idle_mah","model_screen_mah","model_total_mah",   // МОДЕЛЬ
@@ -251,6 +253,17 @@ CLI: `zhord alerts`, `zhord alert-test`, `zhord watch-check [--days N] [--fast]`
   (успех проверяется чтением режима), `stop` — `cmd activity force-stop`. Только приложения (uid ≥ 10000), не сам Жор и не
   `android`. Каждое действие пишется в `actions.jsonl` — от него считается «до/после».
 - `{"cmd":"actions","uid"?}` → `{"actions":[…]}` — новые первыми, за `keep_days`.
+- `{"cmd":"restricted"}` → `{"restricted":[{"pkg","uid","since","prev"}]}` — кого ограничил Жор и кто до сих пор ограничен:
+  по журналу (первое «ограничить» серии хранит режим до Жора, `prev`; если фон был запрещён и до Жора — не наше) и по
+  текущему режиму (поменяли с тех пор сами или переустановили приложение — не трогаем).
+- `{"cmd":"revert_all"}` → `{"ok","reverted":[…],"failed":[…]}` — вернуть всем из `restricted` режим `prev`; каждый возврат
+  пишется в журнал как `unrestrict`. CLI: `zhord restricted`, `zhord revert-all` — работают и без демона.
+
+**Удаление приложения (0.6).** Ядро раз в минуту проверяет `/data/user_de/0/dev.niazlv.zhor`. Если приложение было
+установлено (метка `app_seen` в каталоге данных), а потом пропало дольше чем на 10 минут, ядро делает `revert_all`, выключает
+подробную историю Android (если она была включена), удаляет свой скрипт автозапуска `/data/adb/service.d/zhor.sh` (только если
+в нём есть `zhord`) и останавливается. Записи в `/data/adb/zhor` остаются. Переустановка с другой подписью укладывается
+в секунды и не считается. `ZHOR_UNINSTALL_GRACE_MS` в окружении демона меняет 10 минут — только для проверки.
 - `{"cmd":"compare", …}` — сравнение двух отрезков **по покою** (экран выключен, без зарядки), приведённому к часу:
   - `"mode":"rest"` — два последних долгих периода покоя (≥ 2 ч, включения экрана короче 5 мин склеиваются, зарядка
     обрывает) из корзин в памяти (~3 дня); нет двух — `{"ok":false,"reason":"…","periods":[]}`;
@@ -300,4 +313,4 @@ CLI: `zhord alerts`, `zhord alert-test`, `zhord watch-check [--days N] [--fast]`
 `{"cmd":"prune","before":ms}` или `{"cmd":"prune","all":true}` → `{"ok":true,"removed_files":n,"freed_bytes":..}`.
 Удаляет корзины, снимки и события (до `before` или все) и с диска, и из памяти; после очистки ядро
 само снимет новый снимок batterystats. Необратимо. **(0.4)** История событий тоже: всё до `before` (или всё),
-и ядро запоминает границу (`hist/.floor`), чтобы не вернуть удалённое из буфера Android при следующем снимке. **(0.6)** Тревоги сторожа и журнал действий — тоже.
+и ядро запоминает границу (`hist/.floor`), чтобы не вернуть удалённое из буфера Android при следующем снимке. **(0.6)** Тревоги сторожа — тоже; журнал действий (`actions.jsonl`) — нет: по нему Жор возвращает ограничения фона.

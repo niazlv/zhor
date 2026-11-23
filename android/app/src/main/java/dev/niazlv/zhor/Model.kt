@@ -457,6 +457,13 @@ data class ActionRec(val t: Long, val pkg: String, val uid: Int?, val action: St
     }
 }
 
+/** Ограничение фона, которое поставил Жор и которое до сих пор действует; [prev] — режим до Жора. */
+data class Restr(val pkg: String, val uid: Int?, val since: Long, val prev: String) {
+    companion object {
+        fun parse(o: JSONObject) = Restr(o.str("pkg"), o.intOrNull("uid"), o.lng("since"), o.str("prev"))
+    }
+}
+
 /** Приложение в отрезке сравнения: CPU в покое — ядро; будильники, wakelock, задания — Android за весь отрезок. */
 data class CmpApp(
     val cpuMa: Double, val cpuMah: Double, val startsH: Double,

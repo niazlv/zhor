@@ -3,10 +3,10 @@
 package dev.niazlv.zhor
 
 import android.Manifest
-import android.content.Intent
-import android.content.pm.PackageManager
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.os.Build
-import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -36,6 +36,7 @@ import androidx.compose.material.icons.outlined.Rule
 import androidx.compose.material.icons.outlined.Bedtime
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material.icons.outlined.Block
+import androidx.compose.material.icons.outlined.SettingsBackupRestore
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -58,7 +59,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
 
 /** Человеческое имя правила сторожа. */
@@ -93,6 +94,7 @@ fun WatchScreen(vm: Vm, navi: Navi) {
         vm.loadAlerts()
         vm.loadConfig()
         vm.loadActions(null)
+        vm.loadRestricted()
     }
     // вернулись из настроек уведомлений — перечитать разрешение
     LifecycleResumeEffect(Unit) {
@@ -107,25 +109,42 @@ fun WatchScreen(vm: Vm, navi: Navi) {
             val mute = vm.config.value()?.watchMute ?: vm.alerts.value()?.mute.orEmpty()
             if (mute.isNotEmpty()) item(key = "mute") { MuteCard(vm, mute) }
             item(key = "cmp") { BeforeAfterCard(vm, navi) }
+            item(key = "changes") { SystemChangesCard(vm) }
+        }
+    }
+}
+
+private tailrec fun Context.activity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.activity()
+    else -> null
+}
+
+/**
+ * Включить уведомления: системный запрос разрешения, а если Android его больше не показывает (после двух
+ * отказов) или разрешение есть, но уведомления выключены в настройках, — сразу системные настройки уведомлений.
+ */
+@Composable
+fun rememberNotifRequest(vm: Vm): () -> Unit {
+    val ctx = LocalContext.current
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.refreshNotifState() }
+    return {
+        val act = ctx.activity()
+        when {
+            Notify.permitted(ctx) -> Notify.openSettings(ctx)
+            Build.VERSION.SDK_INT >= 33 && (!vm.notifAsked || (act != null && ActivityCompat.shouldShowRequestPermissionRationale(act, Manifest.permission.POST_NOTIFICATIONS))) -> {
+                vm.notifAsked = true
+                launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            else -> Notify.openSettings(ctx)
         }
     }
 }
 
 @Composable
 private fun WatchHead(vm: Vm) {
-    val ctx = LocalContext.current
     val cfg = vm.config.value()
-    val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.refreshNotifState() }
-    fun askNotif() {
-        val need = Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        if (need) {
-            perm.launch(Manifest.permission.POST_NOTIFICATIONS)
-        } else {
-            // разрешение есть, но уведомления выключены в системе — открыть их настройки
-            ctx.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName))
-        }
-    }
+    val askNotif = rememberNotifRequest(vm)
     val unsupported = (vm.alerts as? Res.Err)?.unsupported == true || (cfg != null && cfg.watch == null)
     Section("Сторож", sub = "ядро само скажет, когда смотреть", icon = Icons.Outlined.NotificationsActive) {
         if (vm.fileMode) {
@@ -158,7 +177,7 @@ private fun WatchHead(vm: Vm) {
         if (on && !vm.notifAllowed) {
             Spacer(Modifier.height(10.dp))
             Note(Lvl.WARN, "Уведомления Жору запрещены: тревоги будут копиться только в списке ниже.")
-            FilledTonalButton(onClick = { askNotif() }, Modifier.padding(top = 6.dp)) {
+            FilledTonalButton(onClick = askNotif, Modifier.padding(top = 6.dp)) {
                 Icon(Icons.Outlined.NotificationsActive, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
                 Text("Разрешить уведомления")
@@ -402,4 +421,46 @@ fun WatchSummary(vm: Vm, navi: Navi) {
     ) {
         InsightCard(Insight(last.level, alertText(vm, last, last.title), "${Fmt.human(last.t)} · ${alertText(vm, last, last.text)}", last.uid, null)) { navi.watch() }
     }
+}
+
+/** Что Жор поменял в системе и как это вернуть — кнопкой, без приложения и при его удалении. */
+@Composable
+fun SystemChangesCard(vm: Vm) {
+    val list = vm.restricted
+    var confirm by rememberSaveable { mutableStateOf(false) }
+    Section("Что Жор меняет в системе", sub = "и как это вернуть", icon = Icons.Outlined.SettingsBackupRestore) {
+        when {
+            vm.fileMode -> Explain("Нужен root.")
+            list == null -> SkeletonLine(0.6f, 14.dp, shimmerBrush())
+            list.isEmpty() -> KV("Ограничено Жором", "ничего")
+            else -> {
+                KV("Ограничено Жором", "${list.size} ${Fmt.plural(list.size.toLong(), "приложение", "приложения", "приложений")}", lvl = Lvl.INFO)
+                list.forEach { r ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (r.uid != null) {
+                            UidIcon(vm, r.uid, r.pkg, 26.dp)
+                            Spacer(Modifier.width(10.dp))
+                        }
+                        Text(vm.labelOfPackage(r.pkg) + if ((r.uid ?: 0) >= 100_000) " (польз. ${r.uid!! / 100_000})" else "", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Text("с ${Fmt.human(r.since)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                FilledTonalButton(onClick = { confirm = true }, enabled = !vm.acting, modifier = Modifier.padding(top = 6.dp)) {
+                    Icon(Icons.Outlined.SettingsBackupRestore, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Вернуть всё")
+                }
+            }
+        }
+        Explain("«Остановить» — разовое: приложение оживает, как только его откроют. «Ограничить фон» — стандартное ограничение Android, его можно снять и в настройках батареи приложения. «Вернуть всё» вернёт режим, который был до Жора, и не тронет то, что вы с тех пор поменяли сами.")
+        Explain("Если удалить Жор, ядро через 10 минут само вернёт ограничения, выключит подробную историю Android, уберёт свой автозапуск и остановится. Записи останутся в ${Core.DIR}.")
+        Explain("Отнять у Жора root мало: ядро уже работает от root и продолжит. Сначала нажмите «Вернуть всё» или удалите приложение. Без приложения то же делает команда zhord revert-all.")
+    }
+    if (confirm && !list.isNullOrEmpty()) AlertDialog(
+        onDismissRequest = { confirm = false },
+        title = { Text("Вернуть всё?") },
+        text = { Text("Снова разрешить работу в фоне: ${list.joinToString { vm.labelOfPackage(it.pkg) }}. Вернётся режим, который был до Жора.") },
+        confirmButton = { TextButton(onClick = { confirm = false; vm.revertAll() }) { Text("Вернуть") } },
+        dismissButton = { TextButton(onClick = { confirm = false }) { Text("Отмена") } },
+    )
 }

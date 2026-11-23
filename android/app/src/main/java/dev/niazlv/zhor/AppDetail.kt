@@ -95,7 +95,7 @@ fun AppDetailScreen(vm: Vm, navi: Navi, uid: Int, seg: String?) {
 
 @Composable
 private fun AppDetailContent(vm: Vm, navi: Navi, r: Report, a: App, seg: String?, modifier: Modifier) {
-    val total = r.totals.measuredMah.takeIf { it > 0 } ?: r.apps.sumOf { it.mah }
+    val total = shareBase(r)
     val rank = r.apps.indexOfFirst { it.uid == a.uid } + 1
     LazyColumn(modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
         item(key = "hero") { Hero(vm, a, total, rank, r.apps.size) }

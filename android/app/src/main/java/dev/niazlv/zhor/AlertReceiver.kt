@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -58,11 +59,32 @@ object Notify {
         nm.createNotificationChannel(ch)
     }
 
+    fun permitted(ctx: Context): Boolean = Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+    /** Разрешение есть, уведомления приложения включены и канал «Сторож» не выключен. */
     fun allowed(ctx: Context): Boolean {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) return false
-        return NotificationManagerCompat.from(ctx).areNotificationsEnabled()
+        if (!permitted(ctx)) return false
+        if (!NotificationManagerCompat.from(ctx).areNotificationsEnabled()) return false
+        val ch = ctx.getSystemService(NotificationManager::class.java)?.getNotificationChannel(CHANNEL)
+        return ch == null || ch.importance != NotificationManager.IMPORTANCE_NONE
+    }
+
+    /** Системные настройки уведомлений: приложения целиком или канала «Сторож», если выключен только он. */
+    fun openSettings(ctx: Context) {
+        val appOn = NotificationManagerCompat.from(ctx).areNotificationsEnabled()
+        val i = if (appOn) {
+            ensureChannel(ctx)
+            Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_CHANNEL_ID, CHANNEL)
+        } else {
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+        }
+        i.putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            ctx.startActivity(i)
+        } catch (_: Exception) {
+            ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.fromParts("package", ctx.packageName, null)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }
     }
 
     /** Пакет → подпись, но только сам пакет: имена процессов («com.app:sync») остаются как есть. */

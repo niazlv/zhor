@@ -157,7 +157,7 @@ private fun ScreenCard(r: Report, goTab: ((Int) -> Unit)?) {
             val off = Norms.drainOff(t.pctPerHourOff, t.screenOffMs)
             MetricTile(
                 "Экран выкл.", Fmt.dur(t.screenOffMs), Modifier.weight(1f), lvl = off,
-                sub = if (t.screenOffMs > 0) "≈ ${Fmt.ma(t.measuredOffMa)} мА · ${Fmt.d1(t.pctPerHourOff)} %/ч" else "не выключался",
+                sub = if (t.screenOffMs > 0) "≈ ${Fmt.ma(t.measuredOffMa)} мА · ${Fmt.d1(t.pctPerHourOff)} %/ч" else "не выключался без зарядки",
             )
         }
         Spacer(Modifier.height(8.dp))
