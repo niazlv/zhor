@@ -30,7 +30,7 @@ build_app() {
 
 case "$1" in
     core) build_core ;;
-    app) build_app; [ "$2" = "install" ] && adb install -r "$APK" ;;
+    app) build_app; if [ "$2" = "install" ]; then adb install -r "$APK"; fi ;;
     install) build_core; build_app; adb install -r "$APK" ;;
     *) build_core; build_app ;;
 esac

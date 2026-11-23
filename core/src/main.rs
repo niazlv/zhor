@@ -19,6 +19,8 @@ mod store;
 mod sys;
 mod sysfs;
 mod util;
+mod watch;
+mod compare;
 
 use serde_json::json;
 use std::path::PathBuf;

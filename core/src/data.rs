@@ -25,11 +25,39 @@ pub struct Config {
     /// как часто читать полную историю Android (`-c --history`, ~0,4 с CPU system_server), мин;
     /// буфер Android держит ~20 ч с full_history и ~45 ч без — раз в 3 ч с запасом
     pub hist_every_min: u64,
+    /// (0.6) сторож: проверять правила и слать тревоги приложению
+    pub watch: bool,
+    /// тревога, если в глубоком сне меньше этой доли покоя, % (0 — правило выключено)
+    pub watch_sleep_pct: f64,
+    /// разряд в покое больше, %/ч
+    pub watch_drain_pct_h: f64,
+    /// источник пробуждения будит чаще, раз в час
+    pub watch_wakeups_h: f64,
+    /// приложение тратит процессор в покое больше, мА в среднем
+    pub watch_app_ma: f64,
+    /// батарея горячее, °C, при выключенном экране
+    pub watch_hot_c: f64,
+    /// «не напоминать»: ключи тревог (правило или правило:виновник)
+    pub watch_mute: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { interval_on_ms: 5_000, interval_off_ms: 20_000, keep_days: 10, snap_every_min: 60, full_history: false, hist_every_min: 180 }
+        Config {
+            interval_on_ms: 5_000,
+            interval_off_ms: 20_000,
+            keep_days: 10,
+            snap_every_min: 60,
+            full_history: false,
+            hist_every_min: 180,
+            watch: true,
+            watch_sleep_pct: 50.0,
+            watch_drain_pct_h: 3.0,
+            watch_wakeups_h: 600.0,
+            watch_app_ma: 10.0,
+            watch_hot_c: 40.0,
+            watch_mute: Vec::new(),
+        }
     }
 }
 
@@ -48,6 +76,17 @@ impl Config {
         self.keep_days = self.keep_days.clamp(1, 90);
         self.snap_every_min = self.snap_every_min.clamp(10, 1_440);
         self.hist_every_min = self.hist_every_min.clamp(30, 1_440);
+        // 0 — правило выключено; иначе — в разумных пределах
+        let opt = |v: f64, lo: f64, hi: f64| if v <= 0.0 || !v.is_finite() { 0.0 } else { v.clamp(lo, hi) };
+        self.watch_sleep_pct = opt(self.watch_sleep_pct, 5.0, 95.0);
+        self.watch_drain_pct_h = opt(self.watch_drain_pct_h, 0.5, 50.0);
+        self.watch_wakeups_h = opt(self.watch_wakeups_h, 30.0, 100_000.0);
+        self.watch_app_ma = opt(self.watch_app_ma, 1.0, 1_000.0);
+        self.watch_hot_c = opt(self.watch_hot_c, 30.0, 60.0);
+        self.watch_mute.retain(|k| !k.is_empty() && k.len() <= 200);
+        self.watch_mute.sort();
+        self.watch_mute.dedup();
+        self.watch_mute.truncate(100);
         self
     }
 
@@ -120,7 +159,7 @@ pub fn storage(d: &Daemon) -> Value {
     }
     total += b_bytes;
     let mut groups = vec![json!({"kind": "buckets", "files": b_files, "bytes": b_bytes, "records": b_rec, "from": b_from, "to": b_to})];
-    for (kind, name) in [("snaps", "snaps.jsonl"), ("events", "events.jsonl")] {
+    for (kind, name) in [("snaps", "snaps.jsonl"), ("events", "events.jsonl"), ("alerts", "alerts.jsonl"), ("actions", "actions.jsonl")] {
         let p = dir.join(name);
         let (bytes, n, first, last) = file_stats(&p);
         total += bytes;
