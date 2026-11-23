@@ -1,0 +1,23 @@
+[package]
+name = "zhord"
+version = "0.5.0"
+edition = "2021"
+description = "Жор: root-профилировщик энергопотребления Android (ядро-демон и CLI)"
+license = "MIT"
+repository = "https://github.com/niazlv/zhor"
+
+[[bin]]
+name = "zhord"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

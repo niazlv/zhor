@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="128" height="128" role="img" aria-label="Жор">
+  <rect width="108" height="108" rx="26" fill="#26221F"/>
+  <!-- батарейка, у которой откушен угол, и молния -->
+  <path fill="#FFFFFF" d="M46,28h16v5h-16z"/>
+  <path fill="#FFFFFF" d="M40,33h28a5,5 0 0 1 5,5v38a5,5 0 0 1 -5,5h-28a5,5 0 0 1 -5,-5v-38a5,5 0 0 1 5,-5z"/>
+  <circle cx="73" cy="37" r="7" fill="#26221F"/>
+  <circle cx="75" cy="48" r="6" fill="#26221F"/>
+  <path fill="#E8553E" d="M56,41l-12,20h8l-3,14l12,-20h-8z"/>
+</svg>
