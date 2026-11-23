@@ -18,7 +18,7 @@ Root-профилировщик энергопотребления. Ядро н�
 ![Kotlin](https://img.shields.io/badge/интерфейс-Kotlin%20·%20Compose-7F52FF?logo=kotlin&logoColor=white)
 ![offline](https://img.shields.io/badge/интернет-не%20нужен-2BB3A3)
 
-**[Скачать APK](https://github.com/niazlv/zhor/releases/latest)** · [English](README.en.md) · [API ядра](docs/api.md) · [Как это работает](#как-это-работает) · [Изменения](CHANGELOG.md)
+**[Скачать APK](https://github.com/niazlv/zhor/releases/latest/download/zhor.apk)** · [English](README.en.md) · [API ядра](docs/api.md) · [Как это работает](#как-это-работает) · [Изменения](CHANGELOG.md)
 
 </div>
 
@@ -116,7 +116,9 @@ flowchart LR
 
 ## Установка
 
-1. Скачайте `zhor-*.apk` из [последнего выпуска](https://github.com/niazlv/zhor/releases/latest) и установите.
+1. Скачайте APK последней версии — [`zhor.apk`](https://github.com/niazlv/zhor/releases/latest/download/zhor.apk) (постоянная ссылка, всегда на свежий выпуск; удобна для
+   обновлялок вроде Obtainium) или `zhor-*.apk` со страницы [последнего выпуска](https://github.com/niazlv/zhor/releases/latest), —
+   и установите.
 2. Откройте «Жор» и разрешите ему root в KernelSU или Magisk. Приложение само скопирует ядро в
    `/data/adb/zhor/bin/zhord` и запустит его; при обновлении ставит ядро, только если его сборка новее.
 3. Автозапуск после перезагрузки включается в настройках приложения.

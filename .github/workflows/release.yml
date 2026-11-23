@@ -67,6 +67,8 @@ jobs:
           rm -f "$RUNNER_TEMP/zhor-release.jks"
           mkdir dist
           cp android/app/build/outputs/apk/release/app-release.apk "dist/zhor-$VERSION.apk"
+          # копия без версии: …/releases/latest/download/zhor.apk всегда отдаёт последний APK
+          cp "dist/zhor-$VERSION.apk" dist/zhor.apk
           cp core/target/aarch64-linux-android/release/zhord "dist/zhord-$VERSION-aarch64-android"
           apksigner="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
           "$apksigner" verify --print-certs "dist/zhor-$VERSION.apk" | tee certs.txt
@@ -84,7 +86,8 @@ jobs:
 
           ### Установка
 
-          1. Скачайте \`zhor-$VERSION.apk\` и установите.
+          1. Скачайте \`zhor-$VERSION.apk\` и установите. \`zhor.apk\` — тот же файл; постоянная ссылка на последний
+             выпуск: https://github.com/${{ github.repository }}/releases/latest/download/zhor.apk
           2. Откройте «Жор» и выдайте root в KernelSU или Magisk — приложение само поставит и запустит ядро.
 
           Нужны Android 12+, arm64 и root. \`zhord-$VERSION-aarch64-android\` — то же ядро отдельно, для командной строки.

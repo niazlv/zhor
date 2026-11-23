@@ -18,7 +18,7 @@ against the battery's coulomb counter and explains who, where, how much and why.
 ![Kotlin](https://img.shields.io/badge/UI-Kotlin%20·%20Compose-7F52FF?logo=kotlin&logoColor=white)
 ![offline](https://img.shields.io/badge/internet-not%20needed-2BB3A3)
 
-**[Download APK](https://github.com/niazlv/zhor/releases/latest)** · [Русский](README.md) · [Core API](docs/api.md) · [How it works](#how-it-works) · [Changelog](CHANGELOG.md)
+**[Download APK](https://github.com/niazlv/zhor/releases/latest/download/zhor.apk)** · [Русский](README.md) · [Core API](docs/api.md) · [How it works](#how-it-works) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -120,7 +120,9 @@ flowchart LR
 
 ## Install
 
-1. Download `zhor-*.apk` from the [latest release](https://github.com/niazlv/zhor/releases/latest) and install it.
+1. Download the latest APK — [`zhor.apk`](https://github.com/niazlv/zhor/releases/latest/download/zhor.apk) (a permanent link that always points to the newest release; handy
+   for updaters like Obtainium) or `zhor-*.apk` from the [latest release](https://github.com/niazlv/zhor/releases/latest) page —
+   and install it.
 2. Open Zhor and grant it root in KernelSU or Magisk. It copies the core to `/data/adb/zhor/bin/zhord` and
    starts it; on updates it replaces the core only if the bundled build is newer.
 3. Start on boot is a toggle in the app's settings.
