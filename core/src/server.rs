@@ -154,6 +154,21 @@ fn refresh_history(d: &Arc<Mutex<Daemon>>, dir: &PathBuf) {
     }
 }
 
+/// Доставить тревоги сторожа приложению и записать их (вне замка демона: `cmd` — сотни мс).
+fn spawn_deliver(d: Arc<Mutex<Daemon>>, dir: PathBuf, alerts: Vec<crate::watch::Alert>) {
+    std::thread::spawn(move || {
+        for mut a in alerts {
+            let (ok, out) = crate::watch::deliver(&a);
+            a.sent = ok;
+            let tail = if ok { String::new() } else { format!(" — не доставлено: {out}") };
+            log(&dir, &format!("сторож: {} «{}»{tail}", a.key, a.title));
+            if let Ok(mut g) = d.lock() {
+                g.watch.record(a);
+            }
+        }
+    });
+}
+
 fn spawn_snapshot(d: Arc<Mutex<Daemon>>, dir: PathBuf) {
     if SNAP_RUNNING.swap(true, Ordering::SeqCst) {
         return;
@@ -215,6 +230,11 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.tick()));
             if r.is_err() {
                 log(&dir, "паника в шаге сбора — пропуск");
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.watch_eval())) {
+                Ok(alerts) if !alerts.is_empty() => spawn_deliver(d.clone(), dir.clone(), alerts),
+                Ok(_) => {}
+                Err(_) => log(&dir, "паника в стороже — пропуск"),
             }
             if g.snap_due(util::real_ms()) && !SNAP_RUNNING.load(Ordering::SeqCst) {
                 g.want_snap = false;
@@ -371,6 +391,67 @@ fn handle(conn: UnixStream, d: Arc<Mutex<Daemon>>, dir: PathBuf) {
                 let r = crate::data::prune(&mut g, &raw);
                 log(&dir, &format!("очистка данных: {r}"));
                 r.to_string()
+            }
+            "alerts" => {
+                let raw = raw_req(&line);
+                let limit = raw["limit"].as_u64().unwrap_or(100) as usize;
+                let since = raw["since"].as_i64().unwrap_or(0);
+                let g = d.lock().unwrap();
+                let list: Vec<&crate::watch::Alert> = g.watch.alerts.iter().rev().filter(|a| a.t >= since).take(limit).collect();
+                json!({
+                    "alerts": list, "watch": g.config.watch, "mute": g.config.watch_mute,
+                    "last_eval": g.watch.last_eval, "cost_us": g.watch.last_cost_us,
+                })
+                .to_string()
+            }
+            "alert_test" => {
+                // проверочная в журнал тревог не пишется — только в журнал ядра
+                let a = crate::watch::test_alert(util::real_ms());
+                let (ok, out) = crate::watch::deliver(&a);
+                log(&dir, &format!("сторож: проверка — {}", if ok { "доставлено" } else { "не доставлено" }));
+                json!({"ok": ok, "out": out}).to_string()
+            }
+            "mute" => {
+                let raw = raw_req(&line);
+                match raw["key"].as_str().filter(|k| !k.is_empty()) {
+                    None => json!({"error": "нужен key"}).to_string(),
+                    Some(key) => {
+                        let on = raw["on"].as_bool().unwrap_or(true);
+                        let mut g = d.lock().unwrap();
+                        let mut c = g.config.clone();
+                        c.watch_mute.retain(|k| k != key);
+                        if on {
+                            c.watch_mute.push(key.to_string());
+                        }
+                        g.set_config(c.clamped());
+                        log(&dir, &format!("сторож: {} «{key}»", if on { "не напоминать" } else { "снова напоминать" }));
+                        serde_json::to_string(&g.config).unwrap_or_default()
+                    }
+                }
+            }
+            "app_state" => {
+                let raw = raw_req(&line);
+                let uid = raw["uid"].as_u64().map(|u| u as u32);
+                crate::compare::app_state(raw["pkg"].as_str().unwrap_or(""), uid).to_string()
+            }
+            "act" => {
+                let raw = raw_req(&line);
+                let uid = raw["uid"].as_u64().map(|u| u as u32);
+                let (pkg, action) = (raw["pkg"].as_str().unwrap_or(""), raw["action"].as_str().unwrap_or(""));
+                let r = crate::compare::act(&dir, pkg, uid, action);
+                log(&dir, &format!("действие {action} {pkg}: {}", if r["ok"].as_bool().unwrap_or(false) { "ок" } else { "не вышло" }));
+                r.to_string()
+            }
+            "actions" => {
+                let raw = raw_req(&line);
+                let uid = raw["uid"].as_u64().map(|u| u as u32);
+                let keep = d.lock().unwrap().config.keep_days;
+                json!({"actions": crate::compare::actions(&dir, uid, keep)}).to_string()
+            }
+            "compare" => {
+                let raw = raw_req(&line);
+                let g = d.lock().unwrap();
+                crate::compare::compare(&g, &raw).to_string()
             }
             "stop" => {
                 STOP.store(true, Ordering::SeqCst);

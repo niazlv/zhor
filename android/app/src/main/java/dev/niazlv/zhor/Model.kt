@@ -315,10 +315,24 @@ data class CoreConfig(
     val intervalOnMs: Long, val intervalOffMs: Long, val keepDays: Int, val snapEveryMin: Int,
     /** Подробная история Android (ядро 0.4): каждый wakelock, будильники, процессы. */
     val fullHistory: Boolean = false,
+    /** (0.6) Сторож и пороги его правил; 0 — правило выключено. null — ядро сторожа не знает. */
+    val watch: Boolean? = null,
+    val watchSleepPct: Double = 50.0,
+    val watchDrainPctH: Double = 3.0,
+    val watchWakeupsH: Double = 600.0,
+    val watchAppMa: Double = 10.0,
+    val watchHotC: Double = 40.0,
+    val watchMute: List<String> = emptyList(),
 ) {
-    fun json(): JSONObject = JSONObject()
-        .put("interval_on_ms", intervalOnMs).put("interval_off_ms", intervalOffMs)
-        .put("keep_days", keepDays).put("snap_every_min", snapEveryMin).put("full_history", fullHistory)
+    fun json(): JSONObject {
+        val o = JSONObject()
+            .put("interval_on_ms", intervalOnMs).put("interval_off_ms", intervalOffMs)
+            .put("keep_days", keepDays).put("snap_every_min", snapEveryMin).put("full_history", fullHistory)
+        // «не напоминать» не шлём: его меняет команда mute (в том числе из уведомления), чтобы не затереть
+        if (watch != null) o.put("watch", watch).put("watch_sleep_pct", watchSleepPct).put("watch_drain_pct_h", watchDrainPctH)
+            .put("watch_wakeups_h", watchWakeupsH).put("watch_app_ma", watchAppMa).put("watch_hot_c", watchHotC)
+        return o
+    }
 
     companion object {
         val DEFAULT = CoreConfig(5000, 20000, 10, 60)
@@ -328,6 +342,10 @@ data class CoreConfig(
                 c.optLong("interval_on_ms", DEFAULT.intervalOnMs), c.optLong("interval_off_ms", DEFAULT.intervalOffMs),
                 c.optInt("keep_days", DEFAULT.keepDays), c.optInt("snap_every_min", DEFAULT.snapEveryMin),
                 c.optBoolean("full_history", false),
+                if (c.has("watch")) c.optBoolean("watch") else null,
+                c.optDouble("watch_sleep_pct", 50.0), c.optDouble("watch_drain_pct_h", 3.0),
+                c.optDouble("watch_wakeups_h", 600.0), c.optDouble("watch_app_ma", 10.0),
+                c.optDouble("watch_hot_c", 40.0), c.optJSONArray("watch_mute").strings(),
             )
         }
     }
@@ -398,5 +416,86 @@ data class SystemWork(
             },
             o.optJSONArray("a11y").strings(),
         )
+    }
+}
+
+// ---- (0.6) сторож, действия, сравнение «до/после» ----
+
+/** Тревога сторожа: что заметил ядро в текущем покое. */
+data class WatchAlert(
+    val id: String, val t: Long, val rule: String, val key: String, val level: String,
+    val title: String, val text: String, val uid: Int?, val pkg: String?,
+    val from: Long, val to: Long, val sent: Boolean,
+) {
+    companion object {
+        fun parse(o: JSONObject) = WatchAlert(
+            o.str("id"), o.lng("t"), o.str("rule"), o.str("key"), o.str("level"), o.str("title"), o.str("text"),
+            o.intOrNull("uid"), o.strOrNull("pkg"), o.lng("from"), o.lng("to"), o.optBoolean("sent"),
+        )
+    }
+}
+
+data class Alerts(val list: List<WatchAlert>, val watch: Boolean, val mute: List<String>, val lastEval: Long) {
+    companion object {
+        fun parse(o: JSONObject) = Alerts(
+            o.optJSONArray("alerts").list { WatchAlert.parse(it) }, o.optBoolean("watch", true),
+            o.optJSONArray("mute").strings(), o.lng("last_eval"),
+        )
+    }
+}
+
+/** Может ли приложение работать в фоне (appop RUN_ANY_IN_BACKGROUND) и его корзина ожидания. */
+data class AppState(val pkg: String, val bg: String?, val restricted: Boolean, val bucket: Int?, val bucketName: String?) {
+    companion object {
+        fun parse(o: JSONObject) = AppState(o.str("pkg"), o.strOrNull("bg"), o.optBoolean("restricted"), o.intOrNull("bucket"), o.strOrNull("bucket_name"))
+    }
+}
+
+data class ActionRec(val t: Long, val pkg: String, val uid: Int?, val action: String, val ok: Boolean, val prev: String?) {
+    companion object {
+        fun parse(o: JSONObject) = ActionRec(o.lng("t"), o.str("pkg"), o.intOrNull("uid"), o.str("action"), o.optBoolean("ok"), o.strOrNull("prev"))
+    }
+}
+
+/** Приложение в отрезке сравнения: CPU в покое — ядро; будильники, wakelock, задания — Android за весь отрезок. */
+data class CmpApp(
+    val cpuMa: Double, val cpuMah: Double, val startsH: Double,
+    val alarmsH: Double?, val wakelockMinH: Double?, val jobsH: Double?, val mahH: Double?,
+)
+
+data class CmpWin(
+    val from: Long, val to: Long, val offMs: Long, val deepPct: Double, val pctH: Double, val ma: Double, val mah: Double,
+    val wakeupsH: Double, val suspendsH: Double, val failsH: Double, val cpuMa: Double, val tempMax: Double, val app: CmpApp?,
+) {
+    companion object {
+        fun parse(o: JSONObject) = CmpWin(
+            o.lng("from"), o.lng("to"), o.lng("off_ms"), o.dbl("deep_sleep_pct"), o.dbl("pct_h"), o.dbl("ma"), o.dbl("mah"),
+            o.dbl("wakeups_h"), o.dbl("suspends_h"), o.dbl("fails_h"), o.dbl("cpu_ma"), o.dbl("temp_max"),
+            o.optJSONObject("app")?.let { a ->
+                CmpApp(a.dbl("cpu_ma"), a.dbl("cpu_mah"), a.dbl("starts_h"), a.dblOrNull("alarms_h"), a.dblOrNull("wakelock_min_h"), a.dblOrNull("jobs_h"), a.dblOrNull("mah_h"))
+            },
+        )
+    }
+}
+
+data class CmpRow(val uid: Int, val label: String, val kind: String, val aMa: Double, val bMa: Double)
+
+data class Comparison(
+    val ok: Boolean, val reason: String?, val mode: String, val uid: Int?, val enough: Boolean, val minOffMs: Long,
+    val a: CmpWin?, val b: CmpWin?, val apps: List<CmpRow>, val periods: List<Pair<Long, Long>>, val notes: List<String>,
+) {
+    companion object {
+        fun parse(o: JSONObject): Comparison {
+            val per = o.optJSONArray("periods")
+            val periods = if (per == null) emptyList() else (0 until per.length()).mapNotNull { i ->
+                per.optJSONArray(i)?.let { it.optLong(0) to it.optLong(1) }
+            }
+            return Comparison(
+                o.optBoolean("ok"), o.strOrNull("reason"), o.str("mode"), o.intOrNull("uid"), o.optBoolean("enough"), o.lng("min_off_ms"),
+                o.optJSONObject("a")?.let { CmpWin.parse(it) }, o.optJSONObject("b")?.let { CmpWin.parse(it) },
+                o.optJSONArray("apps").list { CmpRow(it.optInt("uid"), it.str("label"), it.str("kind"), it.dbl("a_ma"), it.dbl("b_ma")) },
+                periods, o.optJSONArray("notes").strings(),
+            )
+        }
     }
 }

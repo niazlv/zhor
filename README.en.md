@@ -75,6 +75,12 @@ Zhor is rebuilt on what modern kernels and Android actually provide, and answers
   draining right then; a range opens as a full report.
 - **Android history.** batterystats events (wakelocks, jobs, syncs, screen, doze) to the millisecond —
   as a per-app timeline.
+- **Watchdog.** A notification while the problem is happening, not the next morning: the phone does not sleep,
+  the battery melts while idle, something wakes the CPU thousands of times an hour, an app keeps working in the
+  background, the phone heats up in a pocket. Thresholds are adjustable, noise can be muted. Checks run on the
+  core's regular step and never wake the phone.
+- **Before and after.** Restrict an app's background work or stop it right from its card, then compare idle time
+  before and after: current, drain, sleep, wakeups, the app's CPU, alarms and wakelocks. Or just last night vs. tonight.
 - **Now.** Live battery current and who is burning CPU right now.
 - **Your data, at hand.** Storage used and record count per day; export the report as JSON, text or raw
   `.jsonl.gz` records in two taps.
@@ -170,6 +176,8 @@ adb shell su -c '/data/adb/zhor/bin/zhord report'               # since unplug
 adb shell su -c '/data/adb/zhor/bin/zhord report screen_off'    # the last screen-off period
 adb shell su -c '/data/adb/zhor/bin/zhord report 24h --json'    # what the app sees
 adb shell su -c '/data/adb/zhor/bin/zhord oneshot 10'           # no daemon: who is draining right now
+adb shell su -c '/data/adb/zhor/bin/zhord alerts'               # what the watchdog noticed
+adb shell su -c '/data/adb/zhor/bin/zhord compare rest'         # the last two idle periods
 ```
 
 Presets: `since_unplug`, `screen_off`, `charge`, `1h` `3h` `6h` `12h` `24h` `48h`, `all`;
@@ -204,6 +212,8 @@ core/                 zhord, the Rust core
   src/sampler.rs      sampling step, buckets, events, snapshots
   src/report.rs       report: apps, processes, threads, insights, timeline
   src/history.rs      Android event history
+  src/watch.rs        watchdog: idle rules, alerts, delivery to the app
+  src/compare.rs      app actions and before/after comparison
   src/sys/            batterystats (proto, usage, checkin), suspend, binder/looper
   src/explain.rs      "what is this and why" dictionary (Russian)
 android/              the app, Kotlin + Jetpack Compose

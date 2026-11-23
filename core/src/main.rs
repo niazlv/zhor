@@ -4,6 +4,8 @@
 //!   zhord run                   демон на переднем плане
 //!   zhord stop | status | live
 //!   zhord report [пресет] [--json] [--fresh] [--uid N]
+//!   zhord alerts | alert-test   тревоги сторожа
+//!   zhord compare [rest|action МС] [--uid N]   сравнение покоя до/после
 //!   zhord query '<json>'        сырой запрос к демону
 //!   zhord oneshot [секунд]      замер без демона: кто тратит прямо сейчас
 
@@ -19,6 +21,8 @@ mod store;
 mod sys;
 mod sysfs;
 mod util;
+mod watch;
+mod compare;
 
 use serde_json::json;
 use std::path::PathBuf;
@@ -32,6 +36,10 @@ fn usage() -> ! {
          \n  zhord run [--dir D]         демон на переднем плане\
          \n  zhord stop | status | live\
          \n  zhord report [since_unplug|screen_off|charge|1h|3h|6h|12h|24h|48h|all] [--json] [--fresh] [--uid N]\
+         \n  zhord alerts                тревоги сторожа\
+         \n  zhord alert-test            проверочная тревога в приложение\
+         \n  zhord watch-check [--days N] [--fast]  прогон правил сторожа по записям (только чтение)\
+         \n  zhord compare [rest | action МС] [--uid N]   сравнение покоя до/после\
          \n  zhord query '<json>'\
          \n  zhord oneshot [секунд]      замер без демона\
          \n  zhord parse usage|checkin|suspend ФАЙЛ   (отладка разборщиков)\
@@ -177,6 +185,87 @@ fn main() {
                 std::process::exit(1)
             }
         },
+        "alerts" => match server::request(&json!({"cmd": "alerts", "limit": 30}), 30) {
+            Ok(s) => {
+                let v: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+                let list = v["alerts"].as_array().cloned().unwrap_or_default();
+                println!("Сторож: {}; тревог: {}", if v["watch"].as_bool().unwrap_or(false) { "включён" } else { "выключен" }, list.len());
+                for a in &list {
+                    let mark = match a["level"].as_str() {
+                        Some("bad") => "✖",
+                        Some("warn") => "⚠",
+                        _ => "•",
+                    };
+                    let sent = if a["sent"].as_bool().unwrap_or(false) { "" } else { " [не доставлено]" };
+                    println!("\n{mark} {} — {}{sent}\n  {}", report::fmt_time(a["t"].as_i64().unwrap_or(0)), a["title"].as_str().unwrap_or(""), a["text"].as_str().unwrap_or(""));
+                }
+                if let Some(m) = v["mute"].as_array().filter(|m| !m.is_empty()) {
+                    println!("\nНе напоминать: {}", m.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "));
+                }
+            }
+            Err(e) => {
+                eprintln!("демон не отвечает: {e}");
+                std::process::exit(1)
+            }
+        },
+        "watch-check" => {
+            // прогон правил сторожа по записанным корзинам, как если бы он проверял их каждые 5 мин.
+            // Только чтение: файлы корзин не трогает, тревоги никуда не шлёт.
+            let dir = PathBuf::from(arg_val(&args, "--dir").unwrap_or_else(|| DEFAULT_DIR.into()));
+            let days: i64 = arg_val(&args, "--days").and_then(|v| v.parse().ok()).unwrap_or(3);
+            let cfg = data::Config::load(&dir);
+            let cut = util::real_ms() - days * 86_400_000;
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("buckets")).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
+            files.sort();
+            let mut all: Vec<store::Bucket> = Vec::new();
+            for f in files {
+                let Ok(text) = std::fs::read_to_string(&f) else { continue };
+                all.extend(text.lines().filter_map(|l| serde_json::from_str::<store::Bucket>(l).ok()).filter(|b| b.t1 >= cut));
+            }
+            all.sort_by_key(|b| b.t0);
+            let pkgs = sys::packages();
+            let br = sysfs::BatteryReader::new();
+            let cap = br.full_capacity_mah().or(br.design_capacity_mah());
+            let refs: Vec<&store::Bucket> = all.iter().collect();
+            let mut w = watch::Watch::scratch();
+            // --fast: сроки правил ×0,2 (30 мин покоя → 6) — посмотреть тексты на коротких записях
+            if args.iter().any(|a| a == "--fast") {
+                w.min_scale = 0.2;
+            }
+            let (mut last, mut n, mut cost) = (0i64, 0u32, 0u64);
+            println!("корзин {}, сторож {}, пороги: сон < {} %, разряд > {} %/ч, пробуждений > {}/ч, фон > {} мА, жара ≥ {} °C",
+                all.len(), if cfg.watch { "вкл" } else { "выкл" }, cfg.watch_sleep_pct, cfg.watch_drain_pct_h, cfg.watch_wakeups_h, cfg.watch_app_ma, cfg.watch_hot_c);
+            for i in 0..refs.len() {
+                let now = refs[i].t1;
+                if now - last < watch::EVAL_EVERY_MS {
+                    continue;
+                }
+                last = now;
+                for a in w.eval(&refs[..=i], &cfg, cap, &pkgs, now) {
+                    println!("\n{} [{}] {}\n  {}", report::fmt_time(now), a.level, a.title, a.text);
+                }
+                n += 1;
+                cost = cost.max(w.last_cost_us);
+            }
+            println!("\nпроверок {n}, самая долгая {:.1} мс", cost as f64 / 1000.0);
+        }
+        "alert-test" | "compare" => {
+            let req = if args[1] == "alert-test" {
+                json!({"cmd": "alert_test"})
+            } else {
+                let mode = args.get(2).cloned().unwrap_or_else(|| "rest".into());
+                let t: Option<i64> = args.get(3).and_then(|v| v.parse().ok());
+                let uid: Option<u32> = arg_val(&args, "--uid").and_then(|v| v.parse().ok());
+                json!({"cmd": "compare", "mode": mode, "t": t, "uid": uid})
+            };
+            match server::request(&req, 60) {
+                Ok(s) => println!("{}", serde_json::from_str::<serde_json::Value>(&s).map(|v| serde_json::to_string_pretty(&v).unwrap_or_default()).unwrap_or(s)),
+                Err(e) => {
+                    eprintln!("демон не отвечает: {e}");
+                    std::process::exit(1)
+                }
+            }
+        }
         "report" => {
             let range = args.get(2).filter(|a| !a.starts_with("--")).cloned();
             let json_out = args.iter().any(|a| a == "--json");

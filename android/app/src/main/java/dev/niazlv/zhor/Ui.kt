@@ -91,6 +91,8 @@ class Navi(val nav: NavHostController) {
     fun data() = go("data")
     fun guide(term: String? = null) = go(if (term == null) "guide" else "guide?term=$term")
     fun onboarding() = go("onboarding")
+    fun watch() = go("watch")
+    fun compare(r: CmpReq) = go("compare?mode=${r.mode}&t=${r.t ?: 0}&uid=${r.uid ?: -1}")
     fun back() {
         if (nav.previousBackStackEntry != null) nav.popBackStack()
     }
@@ -111,6 +113,16 @@ fun ZhorApp(vm: Vm) {
         }
     }
     val start = remember { if (vm.onboarded) "home" else "onboarding" }
+    // нажали на уведомление сторожа: отчёт за тот период, поверх — приложение, если оно названо
+    LaunchedEffect(vm.pendingAlert, vm.ready) {
+        val p = vm.pendingAlert ?: return@LaunchedEffect
+        if (!vm.ready) return@LaunchedEffect
+        vm.pendingAlert = null
+        val (from, to, uid) = p
+        vm.loadSegment(from, to)
+        nav.navigate("seg/$from/$to")
+        if (uid != null) nav.navigate("app/$uid?seg=${vm.segKey(from, to)}")
+    }
     CompositionLocalProvider(LocalHelp provides { helpKey = it }) {
         Box(Modifier.fillMaxSize()) {
             NavHost(
@@ -140,6 +152,19 @@ fun ZhorApp(vm: Vm) {
                     arguments = listOf(navArgument("from") { type = NavType.LongType }, navArgument("to") { type = NavType.LongType }),
                 ) { e -> SegmentScreen(vm, navi, e.arguments?.getLong("from") ?: 0, e.arguments?.getLong("to") ?: 0) }
                 composable("settings") { SettingsScreen(vm, navi) }
+                composable("watch") { WatchScreen(vm, navi) }
+                composable(
+                    "compare?mode={mode}&t={t}&uid={uid}",
+                    arguments = listOf(
+                        navArgument("mode") { type = NavType.StringType; defaultValue = "rest" },
+                        navArgument("t") { type = NavType.LongType; defaultValue = 0L },
+                        navArgument("uid") { type = NavType.IntType; defaultValue = -1 },
+                    ),
+                ) { e ->
+                    val a = e.arguments
+                    val req = CmpReq(a?.getString("mode") ?: "rest", a?.getLong("t")?.takeIf { it > 0 }, a?.getInt("uid")?.takeIf { it >= 0 })
+                    CompareScreen(vm, navi, req)
+                }
                 composable("data") { DataScreen(vm, navi) }
                 composable(
                     "guide?term={term}",

@@ -52,6 +52,7 @@ fun SummaryTab(vm: Vm, navi: Navi, goTab: (Int) -> Unit) {
                 if (vm.error == null) item(key = "sk") { SkeletonScreen() }
                 return@LazyColumn
             }
+            item(key = "watch") { WatchSummary(vm, navi) }
             reportOverview(r, vm, navi, seg = null, goTab = goTab)
         }
     }

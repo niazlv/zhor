@@ -72,9 +72,22 @@ class Vm(app: Application) : AndroidViewModel(app) {
     /** Сообщения для снекбара. */
     var toast by mutableStateOf<String?>(null)
 
+    // ---- (0.6) сторож, действия, сравнение ----
+    /** Тревоги сторожа; null внутри Ok не бывает, Err(unsupported) — ядро старше 0.6. */
+    var alerts by mutableStateOf<Res<Alerts>>(Res.Idle)
+    var notifAllowed by mutableStateOf(Notify.allowed(app))
+
+    /** Нажали на уведомление: (from, to, uid) — ZhorApp откроет отчёт за период. */
+    var pendingAlert by mutableStateOf<Triple<Long, Long, Int?>?>(null)
+    val appStates = mutableStateMapOf<String, Res<AppState>>()
+    val actionLog = mutableStateMapOf<Int, List<ActionRec>>()
+    val cmps = mutableStateMapOf<String, Res<Comparison>>()
+    var acting by mutableStateOf(false)
+
     private var liveJob: Job? = null
 
     init {
+        Notify.ensureChannel(app)
         start()
     }
 
@@ -122,6 +135,7 @@ class Vm(app: Application) : AndroidViewModel(app) {
                 report = r
                 updatedAt = System.currentTimeMillis()
                 error = null
+                loadAlerts()
             } catch (e: Exception) {
                 error = e.message ?: e.toString()
             } finally {
@@ -456,6 +470,140 @@ class Vm(app: Application) : AndroidViewModel(app) {
         if (uid % 100000 >= 10000) pm.getPackagesForUid(uid)?.firstOrNull()?.let { return iconOfPkg(it) }
         if (uid % 100000 == 1000) return iconOfPkg("android")
         return null
+    }
+
+    // ---- (0.6) сторож ----
+
+    fun openAlert(from: Long, to: Long, uid: Int?) {
+        pendingAlert = Triple(from, to, uid)
+    }
+
+    fun refreshNotifState() {
+        notifAllowed = Notify.allowed(getApplication())
+    }
+
+    fun loadAlerts() {
+        if (fileMode) {
+            // демо без root: тревоги из alerts.json рядом с report.json (ответ команды alerts)
+            alerts = File(files, "alerts.json").takeIf { it.exists() }
+                ?.let { f -> runCatching { Res.Ok(Alerts.parse(JSONObject(f.readText()))) }.getOrNull() }
+                ?: Res.Err("Сторож работает в ядре — нужен root.")
+            return
+        }
+        if (!ready) return
+        if (alerts !is Res.Ok) alerts = Res.Loading
+        viewModelScope.launch {
+            alerts = try {
+                Res.Ok(withContext(Dispatchers.IO) { core.alerts() })
+            } catch (e: Unsupported) {
+                Res.Err("Сторож появится с ядром 0.6. Сейчас на телефоне более старое ядро — перезапустите приложение, оно обновит ядро.", unsupported = true)
+            } catch (e: Exception) {
+                Res.Err(e.message ?: e.toString())
+            }
+        }
+    }
+
+    fun alertTest() {
+        viewModelScope.launch {
+            toast = try {
+                val (ok, out) = withContext(Dispatchers.IO) { core.alertTest() }
+                refreshNotifState()
+                when {
+                    !ok -> "Ядро не достучалось до приложения: ${out.ifBlank { "нет ответа" }}"
+                    !notifAllowed -> "Ядро достучалось, но уведомления Жору запрещены"
+                    else -> "Отправлено — уведомление должно появиться"
+                }
+            } catch (e: Exception) {
+                "Не вышло: ${e.message}"
+            }
+            loadAlerts()
+        }
+    }
+
+    fun mute(key: String, on: Boolean) {
+        viewModelScope.launch {
+            try {
+                val c = withContext(Dispatchers.IO) { core.mute(key, on) }
+                config = Res.Ok(c)
+                toast = if (on) "Больше не напомню об этом" else "Снова буду напоминать"
+            } catch (e: Exception) {
+                toast = "Не вышло: ${e.message}"
+            }
+            loadAlerts()
+        }
+    }
+
+    // ---- действия с приложением ----
+
+    fun loadAppState(pkg: String, uid: Int) {
+        if (fileMode || !ready) return
+        val k = "$uid/$pkg"
+        if (appStates[k] !is Res.Ok) appStates[k] = Res.Loading
+        viewModelScope.launch {
+            appStates[k] = try {
+                Res.Ok(withContext(Dispatchers.IO) { core.appState(pkg, uid) })
+            } catch (e: Unsupported) {
+                Res.Err("Действия появятся с ядром 0.6.", unsupported = true)
+            } catch (e: Exception) {
+                Res.Err(e.message ?: e.toString())
+            }
+        }
+        loadActions(uid)
+    }
+
+    fun act(pkg: String, uid: Int, action: String, label: String) {
+        if (acting) return
+        acting = true
+        viewModelScope.launch {
+            try {
+                val (ok, st) = withContext(Dispatchers.IO) { core.act(pkg, uid, action) }
+                if (st != null) appStates["$uid/$pkg"] = Res.Ok(st)
+                toast = when {
+                    !ok -> "Не вышло: Android не принял изменение"
+                    action == "restrict" -> "$label: работа в фоне ограничена. Сравнение «до/после» — когда наберётся полтора часа покоя"
+                    action == "unrestrict" -> "$label: работа в фоне снова разрешена"
+                    else -> "$label остановлено"
+                }
+            } catch (e: Exception) {
+                toast = "Не вышло: ${e.message}"
+            } finally {
+                acting = false
+            }
+            loadActions(uid)
+            loadActions(null)
+        }
+    }
+
+    /** Журнал действий: uid или все (ключ −1). */
+    fun loadActions(uid: Int?) {
+        if (fileMode || !ready) return
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { core.actions(uid) } }.onSuccess { actionLog[uid ?: -1] = it }
+        }
+    }
+
+    // ---- сравнение «до/после» ----
+
+    fun loadCompare(req: CmpReq, force: Boolean = false) {
+        val k = req.key
+        if (!force && cmps[k] is Res.Ok) return
+        if (fileMode) {
+            // демо без root: сравнение из compare.json рядом с report.json (ответ команды compare)
+            cmps[k] = File(files, "compare.json").takeIf { it.exists() }
+                ?.let { f -> runCatching { Res.Ok(Comparison.parse(JSONObject(f.readText()))) }.getOrNull() }
+                ?: Res.Err("Сравнение строит ядро — нужен root.")
+            return
+        }
+        cmps[k] = Res.Loading
+        viewModelScope.launch {
+            cmps[k] = try {
+                Res.Ok(withContext(Dispatchers.IO) { core.compare(req) })
+            } catch (e: Unsupported) {
+                Res.Err("Сравнение появится с ядром 0.6.", unsupported = true)
+            } catch (e: Exception) {
+                Res.Err(e.message ?: e.toString())
+            }
+        }
     }
 
     override fun onCleared() {

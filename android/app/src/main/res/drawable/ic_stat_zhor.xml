@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <!-- значок уведомлений: батарейка с откушенным углом и молния (одноцветный) -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M10,2h4v1.5h-4z M8.5,4h7a1.5,1.5 0 0 1 1.5,1.5v0.6a2.2,2.2 0 0 0 -1.4,3.6a2,2 0 0 0 1.4,2.6v8.2a1.5,1.5 0 0 1 -1.5,1.5h-7a1.5,1.5 0 0 1 -1.5,-1.5v-15a1.5,1.5 0 0 1 1.5,-1.5z M12.6,7.5l-3.6,6h2.4l-0.9,4.5l3.6,-6h-2.4z"
+        android:fillType="evenOdd" />
+</vector>

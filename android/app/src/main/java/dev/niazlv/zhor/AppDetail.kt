@@ -124,6 +124,7 @@ private fun AppDetailContent(vm: Vm, navi: Navi, r: Report, a: App, seg: String?
         }
         item(key = "time") { AppTimelineSection(vm, navi, r, a) }
         item(key = "todo") { Advice(a, r) }
+        if (a.kind == "app" && a.packages.isNotEmpty() && !vm.fileMode) item(key = "bg") { BackgroundCard(vm, navi, a) }
         if (a.processes.isNotEmpty()) {
             item(key = "ph") {
                 Row(Modifier.padding(start = 20.dp, end = 12.dp, top = 14.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -283,7 +284,7 @@ private fun Advice(a: App, r: Report) {
         } else {
             val screen = a.components["screen"] ?: 0.0
             if (a.cpuMahScreenOff > 1 || (a.bgMah > 1 && a.bgMah > 0.5 * a.mah) || wlMs > 60_000 || alarms / hours > 10) {
-                add("Ограничьте работу в фоне: «Настройки приложения» → Батарея → «Ограничить» (на Xiaomi — «Контроль активности»).")
+                add("Ограничьте работу в фоне — кнопкой «Ограничить фон» ниже (Жор потом сравнит покой до и после) или в «Настройки приложения» → Батарея → «Ограничить» (на Xiaomi — «Контроль активности»).")
             }
             if (alarms / hours > 10) add("Будит телефон будильниками ${Fmt.times(alarms)} (~${Fmt.d0(alarms / hours)} в час). Отключите в нём лишние уведомления, обновления виджетов или синхронизацию.")
             if (wlMs > 60_000) add("Держал телефон без сна ${Fmt.dur(wlMs)}. Если это не плеер и не навигация — это лишнее.")

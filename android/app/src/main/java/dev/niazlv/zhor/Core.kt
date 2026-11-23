@@ -7,6 +7,11 @@ import java.io.File
 /** Команда есть в контракте, но установленное ядро её ещё не знает (ядро старше 0.3). */
 class Unsupported(msg: String) : Exception(msg)
 
+/** Запрос сравнения: `rest` — два последних периода покоя; `action` — до и после момента [t]. */
+data class CmpReq(val mode: String, val t: Long? = null, val uid: Int? = null) {
+    val key get() = "$mode/${t ?: 0}/${uid ?: -1}"
+}
+
 /** Период запроса: пресет (`24h`, `since_unplug`…) или явный отрезок в мс. */
 data class Span(val range: String? = null, val from: Long? = null, val to: Long? = null) {
     fun put(q: JSONObject): JSONObject {
@@ -152,6 +157,40 @@ class Core(ctx: Context) {
             val rec = if (apps > 0) mapOf("apps" to apps) else emptyMap()
             return ExportResult(kind, out, out.length(), rec, from, to, true)
         }
+    }
+
+    // ---- (0.6) сторож, действия, сравнение ----
+
+    fun alerts(limit: Int = 100): Alerts = Alerts.parse(query(JSONObject().put("cmd", "alerts").put("limit", limit)))
+
+    /** Проверочная тревога: ядро шлёт её приложению тем же путём, что и настоящие. → (доставлено, вывод cmd) */
+    fun alertTest(): Pair<Boolean, String> {
+        val o = query(JSONObject().put("cmd", "alert_test"))
+        return o.optBoolean("ok") to o.optString("out")
+    }
+
+    fun mute(key: String, on: Boolean): CoreConfig = CoreConfig.parse(query(JSONObject().put("cmd", "mute").put("key", key).put("on", on)))
+
+    fun appState(pkg: String, uid: Int): AppState = AppState.parse(query(JSONObject().put("cmd", "app_state").put("pkg", pkg).put("uid", uid)))
+
+    /** restrict | unrestrict | stop. → состояние после действия. */
+    fun act(pkg: String, uid: Int, action: String): Pair<Boolean, AppState?> {
+        val o = query(JSONObject().put("cmd", "act").put("pkg", pkg).put("uid", uid).put("action", action))
+        return o.optBoolean("ok") to o.optJSONObject("state")?.let { AppState.parse(it) }
+    }
+
+    fun actions(uid: Int? = null): List<ActionRec> {
+        val q = JSONObject().put("cmd", "actions")
+        if (uid != null) q.put("uid", uid)
+        val arr = query(q).optJSONArray("actions") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let { o -> ActionRec.parse(o) } }
+    }
+
+    fun compare(req: CmpReq): Comparison {
+        val q = JSONObject().put("cmd", "compare").put("mode", req.mode)
+        if (req.t != null) q.put("t", req.t)
+        if (req.uid != null) q.put("uid", req.uid)
+        return Comparison.parse(query(q))
     }
 
     fun prune(before: Long?, all: Boolean): JSONObject {

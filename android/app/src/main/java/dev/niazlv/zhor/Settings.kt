@@ -30,6 +30,7 @@ import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
 import androidx.compose.material.icons.outlined.Memory
+import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.RestartAlt
 import androidx.compose.material.icons.outlined.School
@@ -87,6 +88,7 @@ fun SettingsScreen(vm: Vm, navi: Navi) {
             item(key = "cfg") { ConfigCard(vm) }
             item(key = "nav") {
                 Section("Ещё") {
+                    NavRow(Icons.Outlined.NotificationsActive, "Сторож и «до/после»", "уведомление в момент проблемы, сравнение покоя") { navi.watch() }
                     NavRow(Icons.Outlined.Storage, "Данные и выгрузка", "место на диске, экспорт отчёта, очистка") { navi.data() }
                     NavRow(Icons.AutoMirrored.Outlined.MenuBook, "Как читать", "термины, нормы, что делать") { navi.guide() }
                     NavRow(Icons.Outlined.School, "Знакомство", "показать вступление ещё раз") { navi.onboarding() }
@@ -152,7 +154,7 @@ private fun CoreCard(vm: Vm) {
     }
 }
 
-private data class Opt(val label: String, val value: Long)
+data class Opt(val label: String, val value: Long)
 
 @Composable
 private fun ConfigCard(vm: Vm) {
@@ -207,7 +209,7 @@ private fun ConfigCard(vm: Vm) {
 }
 
 @Composable
-private fun Choice(title: String, explain: String, opts: List<Opt>, cur: Long, enabled: Boolean, onPick: (Long) -> Unit) {
+fun Choice(title: String, explain: String, opts: List<Opt>, cur: Long, enabled: Boolean, onPick: (Long) -> Unit) {
     Column(Modifier.padding(vertical = 6.dp)) {
         Text(title, style = MaterialTheme.typography.bodyLarge)
         Text(explain, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

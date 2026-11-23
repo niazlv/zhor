@@ -5,6 +5,8 @@
     <!-- метки и иконки всех приложений в отчёте -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
+    <!-- тревоги сторожа -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:label="Жор"
@@ -23,6 +25,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- тревоги сторожа: явная рассылка от ядра (root); снаружи недоступен -->
+        <receiver
+            android:name=".AlertReceiver"
+            android:exported="false" />
 
         <!-- выгрузка отчётов: «Поделиться» отдаёт файл из cache/export -->
         <provider

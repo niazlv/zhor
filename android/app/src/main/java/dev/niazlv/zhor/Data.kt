@@ -92,6 +92,9 @@ private fun groupName(k: String) = when (k) {
     "snaps" -> "Снимки статистики Android"
     "events" -> "События"
     "log" -> "Журнал ядра"
+    "history" -> "История событий Android"
+    "alerts" -> "Тревоги сторожа"
+    "actions" -> "Действия с приложениями"
     else -> k
 }
 
@@ -100,6 +103,9 @@ private fun groupExplain(k: String) = when (k) {
     "snaps" -> "срезы batterystats: раз в час, при смене экрана и зарядки"
     "events" -> "экран, зарядка, запуски ядра"
     "log" -> "сообщения ядра для отладки"
+    "history" -> "wakelock, задания, экран и сон из batterystats, по файлу на день"
+    "alerts" -> "что сторож заметил и прислал уведомлением"
+    "actions" -> "ограничения фона и остановки — для сравнения «до/после»"
     else -> ""
 }
 
