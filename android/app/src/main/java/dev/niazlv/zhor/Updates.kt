@@ -39,7 +39,7 @@ private fun published(iso: String): String =
 
 /**
  * Заметки к выпуску для экрана: без служебного хвоста (установка и проверка — для страницы на GitHub), без
- * обратных кавычек, строки CHANGELOG, перенесённые посреди фразы, склеены, пункты — «•».
+ * обратных кавычек и **, строки CHANGELOG, перенесённые посреди фразы, склеены, пункты — «•».
  */
 private fun notesShort(s: String): String {
     val out = mutableListOf<String>()
@@ -48,7 +48,7 @@ private fun notesShort(s: String): String {
         cur?.let { out += it.toString() }
         cur = null
     }
-    for (raw in s.substringBefore("### Установка").replace("`", "").lines()) {
+    for (raw in s.substringBefore("### Установка").replace("`", "").replace("**", "").lines()) {
         val l = raw.trim()
         val c = cur
         when {

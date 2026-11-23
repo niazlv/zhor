@@ -518,6 +518,8 @@ class Vm(app: Application) : AndroidViewModel(app) {
             prefs.edit().remove("upd_pending").apply()
             if (Updater.installedVersion(app) == p) toast = "Жор обновлён до $p"
         }
+        // при запуске ничего не качается: скачанный раньше APK уже не нужен (при неудаче следующая попытка скачает заново)
+        Updater.cleanup(app)
         viewModelScope.launch {
             val c = runCatching { withContext(Dispatchers.IO) { core.config() } }.getOrNull()
             if (c != null && config !is Res.Ok) config = Res.Ok(c)

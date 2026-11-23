@@ -146,6 +146,11 @@ object Updater {
         return out
     }
 
+    /** Убрать скачанные APK. */
+    fun cleanup(ctx: Context) {
+        File(ctx.cacheDir, "update").listFiles()?.forEach { it.delete() }
+    }
+
     private fun sha256(f: File): String {
         val md = MessageDigest.getInstance("SHA-256")
         f.inputStream().use { i ->
