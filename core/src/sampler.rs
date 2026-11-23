@@ -87,8 +87,6 @@ pub struct Daemon {
     pub cpu_total_us: u64,
     /// история событий Android (свой замок: разбор и запись идут в потоке снимка)
     pub hist: std::sync::Arc<std::sync::Mutex<crate::history::HistStore>>,
-    /// (0.6) сторож: тревоги по свежим корзинам
-    pub watch: crate::watch::Watch,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -122,7 +120,6 @@ impl Daemon {
         store.keep_disk_days = config.keep_days;
         store.prune_disk();
         let hist = std::sync::Arc::new(std::sync::Mutex::new(crate::history::HistStore::open(dir.join("hist"), config.keep_days)));
-        let watch = crate::watch::Watch::open(dir.clone());
         let mut d = Daemon {
             dir: dir.clone(),
             pp,
@@ -156,7 +153,6 @@ impl Daemon {
             cost: StepCost::default(),
             cpu_total_us: 0,
             hist,
-            watch,
         };
         d.load_events();
         d.load_snaps();
@@ -486,7 +482,7 @@ impl Daemon {
     /// Очистка записей (все / раньше before). → (файлов, байт)
     pub fn prune(&mut self, before: Option<i64>) -> (u64, u64) {
         let (mut n, mut freed) = self.store.prune(before);
-        for name in ["snaps.jsonl", "events.jsonl", "actions.jsonl"] {
+        for name in ["snaps.jsonl", "events.jsonl"] {
             let p = self.dir.join(name);
             let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
             if size == 0 {
@@ -534,9 +530,6 @@ impl Daemon {
                 self.events.retain(|e| e.t >= b);
             }
         }
-        let (wn, wf) = self.watch.prune(before);
-        n += wn;
-        freed += wf;
         if let Ok(mut h) = self.hist.lock() {
             let (hn, hf) = h.prune(before);
             n += hn;
@@ -544,29 +537,6 @@ impl Daemon {
         }
         self.want_snap = true;
         (n, freed)
-    }
-
-    /// Сторож: проверить правила по хвосту корзин (не чаще раза в 5 мин, только на шаге сбора).
-    /// Возвращает новые тревоги — доставляет и записывает их вызывающий (вне замка).
-    pub fn watch_eval(&mut self) -> Vec<crate::watch::Alert> {
-        let now = util::real_ms();
-        if !self.watch.due(now) {
-            return Vec::new();
-        }
-        let open = self.open_snapshot();
-        let mut tail: Vec<&crate::store::Bucket> = Vec::new();
-        if let Some(ob) = &open {
-            tail.push(ob);
-        }
-        for b in self.store.mem.iter().rev() {
-            tail.push(b);
-            if b.scr || b.plug {
-                break;
-            }
-        }
-        tail.reverse();
-        let cap = self.full_mah.or(self.design_mah);
-        self.watch.eval(&tail, &self.config, cap, &self.pkgs, now)
     }
 
     pub fn current(&self) -> Option<(Battery, Screen)> {
