@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 27.1.12297006
+
+jobs:
+  build:
+    name: Ядро и APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Тесты и ядро (arm64)
+        run: ./build.sh core
+      - name: APK
+        run: ./build.sh app
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zhor-${{ github.sha }}
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            core/target/aarch64-linux-android/release/zhord
+          retention-days: 14

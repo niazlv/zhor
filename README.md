@@ -9,6 +9,8 @@
 Root-профилировщик энергопотребления. Ядро на Rust меряет каждый поток на каждой частоте процессора,
 сверяет модель с кулоновским счётчиком батареи и объясняет по-русски: кто, где, сколько и почему.
 
+[![Выпуск](https://img.shields.io/github/v/release/niazlv/zhor?label=выпуск&color=E8553E)](https://github.com/niazlv/zhor/releases/latest)
+[![CI](https://github.com/niazlv/zhor/actions/workflows/ci.yml/badge.svg)](https://github.com/niazlv/zhor/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/лицензия-MIT-E8553E)](LICENSE)
 ![Android 12+](https://img.shields.io/badge/Android-12%2B-3DDC84?logo=android&logoColor=white)
 ![root](https://img.shields.io/badge/root-KernelSU%20·%20Magisk-26221F)
@@ -16,7 +18,7 @@ Root-профилировщик энергопотребления. Ядро н�
 ![Kotlin](https://img.shields.io/badge/интерфейс-Kotlin%20·%20Compose-7F52FF?logo=kotlin&logoColor=white)
 ![offline](https://img.shields.io/badge/интернет-не%20нужен-2BB3A3)
 
-[English](README.en.md) · [API ядра](docs/api.md) · [Как это работает](#как-это-работает) · [Сборка](#установка)
+**[Скачать APK](https://github.com/niazlv/zhor/releases/latest)** · [English](README.en.md) · [API ядра](docs/api.md) · [Как это работает](#как-это-работает) · [Изменения](CHANGELOG.md)
 
 </div>
 
@@ -109,7 +111,19 @@ flowchart LR
 
 ## Установка
 
-Готовых сборок пока нет — собирается из исходников одной командой.
+1. Скачайте `zhor-*.apk` из [последнего выпуска](https://github.com/niazlv/zhor/releases/latest) и установите.
+2. Откройте «Жор» и разрешите ему root в KernelSU или Magisk. Приложение само скопирует ядро в
+   `/data/adb/zhor/bin/zhord` и запустит его; при обновлении ставит ядро, только если его сборка новее.
+3. Автозапуск после перезагрузки включается в настройках приложения.
+
+Каждый выпуск собирается в [GitHub Actions](https://github.com/niazlv/zhor/actions/workflows/release.yml)
+из тега, рядом лежат `SHA256SUMS` и аттестация происхождения сборки. Сертификат подписи APK, SHA-256:
+
+```text
+D6:8C:8C:CD:B4:00:27:77:FF:2C:78:91:30:52:4C:05:9D:7B:2E:B4:F2:A6:1D:D5:A1:9D:10:79:EA:CF:46:1C
+```
+
+### Сборка из исходников
 
 Нужно: [Rust](https://rustup.rs) с целью `aarch64-linux-android`, [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk),
 Android SDK 36 с NDK 27, JDK 17–21.
@@ -130,9 +144,19 @@ cargo install cargo-ndk
 NDK ищется в `ANDROID_NDK_HOME` (по умолчанию — путь Android Studio на macOS), JDK — в `JAVA_HOME`.
 Если подключено несколько устройств, выберите нужное через `ANDROID_SERIAL`.
 
-При первом запуске разрешите приложению root в KernelSU или Magisk. Оно само скопирует ядро в
-`/data/adb/zhor/bin/zhord` и запустит его; при обновлении ставит ядро, только если его сборка новее.
-Автозапуск после перезагрузки включается в настройках приложения.
+Своя сборка подписывается отладочным ключом и поверх выпуска с GitHub не встанет — сначала удалите
+приложение (данные ядра в `/data/adb/zhor` останутся). Свой ключ можно указать в
+`~/.android/zhor-release.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`).
+
+### Выпуск версии
+
+Поднять версию в `core/Cargo.toml` и `android/app/build.gradle.kts` (`versionName` и `versionCode`),
+добавить раздел в [`CHANGELOG.md`](CHANGELOG.md) и отправить тег — остальное сделает
+[`release.yml`](.github/workflows/release.yml):
+
+```bash
+git tag v0.5.1 && git push origin v0.5.1
+```
 
 ## Командная строка
 
@@ -182,6 +206,7 @@ core/                 ядро zhord на Rust
 android/              приложение на Kotlin + Jetpack Compose
 docs/api.md           контракт ядро ↔ приложение
 build.sh              сборка: ядро → jniLibs → APK
+.github/workflows/    CI на каждый пуш, выпуск по тегу
 ```
 
 ## Ограничения

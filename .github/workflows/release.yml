@@ -1,0 +1,106 @@
+name: Release
+
+# Выпуск: поднять версию в core/Cargo.toml и android/app/build.gradle.kts (versionName + versionCode),
+# добавить раздел в CHANGELOG.md, затем `git tag vX.Y.Z && git push origin vX.Y.Z`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  NDK_VERSION: 27.1.12297006
+  # отпечаток сертификата подписи релизов: сборка другим ключом не выйдет
+  CERT_SHA256: d68c8ccdb4002777ff2c789130524c059d7b2eb4f2a61dd5a19d1079eacf461c
+
+jobs:
+  release:
+    name: Выпуск ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Версия тега совпадает с версиями ядра, приложения и CHANGELOG
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          grep -q "^version = \"$v\"" core/Cargo.toml || { echo "::error::core/Cargo.toml: версия не $v"; exit 1; }
+          grep -q "versionName = \"$v\"" android/app/build.gradle.kts || { echo "::error::build.gradle.kts: versionName не $v"; exit 1; }
+          grep -q "^## \[$v\]" CHANGELOG.md || { echo "::error::в CHANGELOG.md нет раздела [$v]"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-disabled: true
+
+      - name: Ключ подписи
+        env:
+          KEYSTORE_B64: ${{ secrets.ZHOR_KEYSTORE_B64 }}
+        run: |
+          [ -n "$KEYSTORE_B64" ] || { echo "::error::нет секрета ZHOR_KEYSTORE_B64"; exit 1; }
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/zhor-release.jks"
+          echo "ZHOR_KEYSTORE=$RUNNER_TEMP/zhor-release.jks" >> "$GITHUB_ENV"
+
+      - name: Сборка (тесты, ядро, APK)
+        env:
+          ZHOR_KEYSTORE_PASSWORD: ${{ secrets.ZHOR_KEYSTORE_PASSWORD }}
+          ZHOR_KEY_ALIAS: ${{ secrets.ZHOR_KEY_ALIAS }}
+        run: ./build.sh
+
+      - name: Файлы выпуска и проверка подписи
+        run: |
+          rm -f "$RUNNER_TEMP/zhor-release.jks"
+          mkdir dist
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/zhor-$VERSION.apk"
+          cp core/target/aarch64-linux-android/release/zhord "dist/zhord-$VERSION-aarch64-android"
+          apksigner="$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          "$apksigner" verify --print-certs "dist/zhor-$VERSION.apk" | tee certs.txt
+          grep -q "certificate SHA-256 digest: $CERT_SHA256" certs.txt || { echo "::error::APK подписан не ключом релизов"; exit 1; }
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Заметки к выпуску
+        run: |
+          awk -v v="$VERSION" '
+            /^\[[^]]+\]: / { p = 0 }
+            /^## \[/ { p = index($0, "[" v "]") > 0; next }
+            p' CHANGELOG.md > notes.md
+          fp="$(echo "$CERT_SHA256" | tr a-f A-F | sed 's/../&:/g; s/:$//')"
+          cat >> notes.md <<EOF
+
+          ### Установка
+
+          1. Скачайте \`zhor-$VERSION.apk\` и установите.
+          2. Откройте «Жор» и выдайте root в KernelSU или Magisk — приложение само поставит и запустит ядро.
+
+          Нужны Android 12+, arm64 и root. \`zhord-$VERSION-aarch64-android\` — то же ядро отдельно, для командной строки.
+
+          ### Проверка
+
+          - Сертификат подписи APK, SHA-256: \`$fp\`
+          - Контрольные суммы — в \`SHA256SUMS\`; происхождение сборки: \`gh attestation verify zhor-$VERSION.apk -R ${{ github.repository }}\`
+          EOF
+          cat notes.md
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/*"
+
+      - name: Выпуск на GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Жор $VERSION" --notes-file notes.md --verify-tag

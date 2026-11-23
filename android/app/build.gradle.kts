@@ -1,7 +1,23 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+}
+
+// Ключ релизов: из переменных окружения (CI: ZHOR_KEYSTORE, ZHOR_KEYSTORE_PASSWORD, ZHOR_KEY_ALIAS,
+// ZHOR_KEY_PASSWORD) или из ~/.android/zhor-release.properties (storeFile, storePassword, keyAlias,
+// keyPassword). Без ключа релиз подписывается отладочным ключом — для своих сборок этого достаточно.
+val releaseKey: Properties? = System.getenv("ZHOR_KEYSTORE")?.let { store ->
+    Properties().apply {
+        setProperty("storeFile", store)
+        setProperty("storePassword", System.getenv("ZHOR_KEYSTORE_PASSWORD") ?: "")
+        setProperty("keyAlias", System.getenv("ZHOR_KEY_ALIAS") ?: "zhor")
+        setProperty("keyPassword", System.getenv("ZHOR_KEY_PASSWORD") ?: System.getenv("ZHOR_KEYSTORE_PASSWORD") ?: "")
+    }
+} ?: File(System.getProperty("user.home"), ".android/zhor-release.properties").takeIf { it.isFile }?.let { f ->
+    Properties().apply { f.inputStream().use { load(it) } }
 }
 
 android {
@@ -17,12 +33,19 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    signingConfigs {
+        if (releaseKey != null) create("release") {
+            storeFile = file(releaseKey.getProperty("storeFile"))
+            storePassword = releaseKey.getProperty("storePassword")
+            keyAlias = releaseKey.getProperty("keyAlias")
+            keyPassword = releaseKey.getProperty("keyPassword")
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            // личная сборка: подписываем отладочным ключом, чтобы ставилась поверх
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseKey != null) "release" else "debug")
         }
     }
     compileOptions {

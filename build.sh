@@ -17,7 +17,7 @@ LIB=android/app/src/main/jniLibs/arm64-v8a/libzhord.so
 APK=android/app/build/outputs/apk/release/app-release.apk
 
 build_core() {
-    (cd core && cargo test --quiet && cargo ndk -t arm64-v8a -P 29 build --release)
+    (cd core && cargo test --quiet --locked && cargo ndk -t arm64-v8a -P 29 build --release --locked)
     mkdir -p "$(dirname "$LIB")"
     cp core/target/aarch64-linux-android/release/zhord "$LIB"
     echo "ядро → $LIB ($(wc -c < "$LIB") байт)"

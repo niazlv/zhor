@@ -9,6 +9,8 @@
 A root energy profiler. A Rust core measures every thread at every CPU frequency, checks the model
 against the battery's coulomb counter and explains who, where, how much and why.
 
+[![Release](https://img.shields.io/github/v/release/niazlv/zhor?color=E8553E)](https://github.com/niazlv/zhor/releases/latest)
+[![CI](https://github.com/niazlv/zhor/actions/workflows/ci.yml/badge.svg)](https://github.com/niazlv/zhor/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-E8553E)](LICENSE)
 ![Android 12+](https://img.shields.io/badge/Android-12%2B-3DDC84?logo=android&logoColor=white)
 ![root](https://img.shields.io/badge/root-KernelSU%20·%20Magisk-26221F)
@@ -16,7 +18,7 @@ against the battery's coulomb counter and explains who, where, how much and why.
 ![Kotlin](https://img.shields.io/badge/UI-Kotlin%20·%20Compose-7F52FF?logo=kotlin&logoColor=white)
 ![offline](https://img.shields.io/badge/internet-not%20needed-2BB3A3)
 
-[Русский](README.md) · [Core API](docs/api.md) · [How it works](#how-it-works) · [Build](#install)
+**[Download APK](https://github.com/niazlv/zhor/releases/latest)** · [Русский](README.md) · [Core API](docs/api.md) · [How it works](#how-it-works) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -112,7 +114,19 @@ flowchart LR
 
 ## Install
 
-There are no prebuilt releases yet — it builds from source with one command.
+1. Download `zhor-*.apk` from the [latest release](https://github.com/niazlv/zhor/releases/latest) and install it.
+2. Open Zhor and grant it root in KernelSU or Magisk. It copies the core to `/data/adb/zhor/bin/zhord` and
+   starts it; on updates it replaces the core only if the bundled build is newer.
+3. Start on boot is a toggle in the app's settings.
+
+Every release is built by [GitHub Actions](https://github.com/niazlv/zhor/actions/workflows/release.yml)
+from its tag and ships with `SHA256SUMS` and a build provenance attestation. APK signing certificate, SHA-256:
+
+```text
+D6:8C:8C:CD:B4:00:27:77:FF:2C:78:91:30:52:4C:05:9D:7B:2E:B4:F2:A6:1D:D5:A1:9D:10:79:EA:CF:46:1C
+```
+
+### Build from source
 
 You need [Rust](https://rustup.rs) with the `aarch64-linux-android` target,
 [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk), Android SDK 36 with NDK 27, and JDK 17–21.
@@ -133,9 +147,19 @@ cargo install cargo-ndk
 The NDK is taken from `ANDROID_NDK_HOME` (defaults to the Android Studio path on macOS), the JDK from
 `JAVA_HOME`. With several devices attached, pick one with `ANDROID_SERIAL`.
 
-On first launch, grant the app root in KernelSU or Magisk. It copies the core to
-`/data/adb/zhor/bin/zhord` and starts it; on updates it replaces the core only if the bundled build is newer.
-Start on boot is a toggle in the app's settings.
+A local build is signed with your debug key and won't install over a GitHub release — uninstall the app
+first (the core's data in `/data/adb/zhor` stays). To use your own key, put `storeFile`, `storePassword`,
+`keyAlias` and `keyPassword` into `~/.android/zhor-release.properties`.
+
+### Releasing
+
+Bump the version in `core/Cargo.toml` and `android/app/build.gradle.kts` (`versionName` and `versionCode`),
+add a section to [`CHANGELOG.md`](CHANGELOG.md) and push a tag — [`release.yml`](.github/workflows/release.yml)
+does the rest:
+
+```bash
+git tag v0.5.1 && git push origin v0.5.1
+```
 
 ## Command line
 
@@ -185,6 +209,7 @@ core/                 zhord, the Rust core
 android/              the app, Kotlin + Jetpack Compose
 docs/api.md           core ↔ app contract
 build.sh              build: core → jniLibs → APK
+.github/workflows/    CI on every push, release on tag
 ```
 
 ## Limitations
