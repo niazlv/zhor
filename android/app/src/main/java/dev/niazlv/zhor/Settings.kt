@@ -67,6 +67,7 @@ fun SettingsScreen(vm: Vm, navi: Navi) {
     }
     Scaffold(topBar = { DetailTopBar("Настройки", "ядро, сбор данных, выгрузка", onBack = { navi.back() }) }) { pad ->
         LazyColumn(Modifier.padding(pad).fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
+            item(key = "upd") { UpdateCard(vm) }
             item(key = "core") { CoreCard(vm) }
             item(key = "cost") { SelfCostCard(vm, vm.status.value(), null) }
             item(key = "auto") {

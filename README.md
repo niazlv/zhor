@@ -16,7 +16,7 @@ Root-профилировщик энергопотребления. Ядро н�
 ![root](https://img.shields.io/badge/root-KernelSU%20·%20Magisk-26221F)
 ![Rust](https://img.shields.io/badge/ядро-Rust-B7410E?logo=rust&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/интерфейс-Kotlin%20·%20Compose-7F52FF?logo=kotlin&logoColor=white)
-![offline](https://img.shields.io/badge/интернет-не%20нужен-2BB3A3)
+![offline](https://img.shields.io/badge/интернет-только%20обновления-2BB3A3)
 
 **[Скачать APK](https://github.com/niazlv/zhor/releases/latest/download/zhor.apk)** · [English](README.en.md) · [API ядра](docs/api.md) · [Как это работает](#как-это-работает) · [Изменения](CHANGELOG.md)
 
@@ -122,6 +122,9 @@ flowchart LR
 2. Откройте «Жор» и разрешите ему root в KernelSU или Magisk. Приложение само скопирует ядро в
    `/data/adb/zhor/bin/zhord` и запустит его; при обновлении ставит ядро, только если его сборка новее.
 3. Автозапуск после перезагрузки включается в настройках приложения.
+4. Дальше Жор обновляется сам: раз в сутки проверяет новую версию и присылает уведомление. Ставит — только по
+   кнопке «Обновить»: скачивает APK с GitHub, сверяет контрольную сумму из `SHA256SUMS` и сертификат подписи
+   с установленным Жором и ставит через root, без системного окна установки.
 
 Каждый выпуск собирается в [GitHub Actions](https://github.com/niazlv/zhor/actions/workflows/release.yml)
 из тега, рядом лежат `SHA256SUMS` и аттестация происхождения сборки. Сертификат подписи APK, SHA-256:
@@ -197,7 +200,11 @@ adb shell su -c '/data/adb/zhor/bin/zhord compare rest'         # два пос�
 
 ## Приватность
 
-- У приложения **нет разрешения на интернет** — данные физически не могут уйти с телефона.
+- **Интернет — только для обновлений.** Раз в сутки приложение спрашивает у GitHub номер последней версии
+  (обычный запрос к `api.github.com`, о телефоне ничего не передаётся) и по вашей кнопке скачивает новую.
+  Записи и отчёты никуда не отправляются: вся работа с сетью — в одном файле,
+  [`Updater.kt`](android/app/src/main/java/dev/niazlv/zhor/Updater.kt). Проверку можно выключить в настройках,
+  ядро `zhord` в сеть не ходит вовсе.
 - Всё хранится в `/data/adb/zhor` и удаляется кнопкой в приложении.
 - Ядро принимает запросы только от root (проверка `SO_PEERCRED`) и пишет выгрузки только в папку
   приложения и общие каталоги.

@@ -205,6 +205,12 @@ class Core(ctx: Context) {
         return Comparison.parse(query(q))
     }
 
+    /** Поставить скачанный и проверенный APK (ядро, `pm install`). При успехе приложение закроется и откроется снова. */
+    fun installApk(path: String): Pair<Boolean, String> {
+        val o = query(JSONObject().put("cmd", "install_apk").put("path", path))
+        return o.optBoolean("ok") to o.optString("out")
+    }
+
     fun prune(before: Long?, all: Boolean): JSONObject {
         val q = JSONObject().put("cmd", "prune")
         if (all) q.put("all", true) else q.put("before", before ?: 0L)

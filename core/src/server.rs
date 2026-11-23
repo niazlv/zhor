@@ -222,6 +222,8 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
 
     // приложение удалили — вернуть ограничения, убрать автозапуск и остановиться
     let mut guard = crate::guard::Guard::new(&dir);
+    // раз в сутки напомнить приложению проверить новую версию
+    let mut upd = crate::update::Ping::new(&dir);
 
     // цикл сбора
     loop {
@@ -259,6 +261,15 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
                 STOP.store(true, Ordering::SeqCst);
                 continue;
             }
+        }
+        let now = util::real_ms();
+        if upd.due(now, d.lock().map(|g| g.config.update_check).unwrap_or(false)) {
+            upd.mark(now);
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let ok = crate::update::ping_app();
+                log(&dir, &format!("обновления: напомнил приложению проверить{}", if ok { "" } else { " — не доставлено" }));
+            });
         }
         // спим кусками, чтобы быстро реагировать на stop
         let mut left = iv;
@@ -455,6 +466,14 @@ fn handle(conn: UnixStream, d: Arc<Mutex<Daemon>>, dir: PathBuf) {
                 let (pkg, action) = (raw["pkg"].as_str().unwrap_or(""), raw["action"].as_str().unwrap_or(""));
                 let r = crate::compare::act(&dir, pkg, uid, action);
                 log(&dir, &format!("действие {action} {pkg}: {}", if r["ok"].as_bool().unwrap_or(false) { "ок" } else { "не вышло" }));
+                r.to_string()
+            }
+            "install_apk" => {
+                let raw = raw_req(&line);
+                let path = raw["path"].as_str().unwrap_or("").to_string();
+                log(&dir, &format!("обновление: ставлю {path}"));
+                let r = crate::update::install_apk(&path);
+                log(&dir, &format!("обновление: {}", r["out"].as_str().or(r["error"].as_str()).unwrap_or("?")));
                 r.to_string()
             }
             "restricted" => json!({"restricted": crate::compare::restricted(&dir)}).to_string(),

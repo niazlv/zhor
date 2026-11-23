@@ -323,6 +323,8 @@ data class CoreConfig(
     val watchAppMa: Double = 10.0,
     val watchHotC: Double = 40.0,
     val watchMute: List<String> = emptyList(),
+    /** (0.7) Раз в сутки проверять новую версию. null — ядро этого не знает. */
+    val updateCheck: Boolean? = null,
 ) {
     fun json(): JSONObject {
         val o = JSONObject()
@@ -331,6 +333,7 @@ data class CoreConfig(
         // «не напоминать» не шлём: его меняет команда mute (в том числе из уведомления), чтобы не затереть
         if (watch != null) o.put("watch", watch).put("watch_sleep_pct", watchSleepPct).put("watch_drain_pct_h", watchDrainPctH)
             .put("watch_wakeups_h", watchWakeupsH).put("watch_app_ma", watchAppMa).put("watch_hot_c", watchHotC)
+        if (updateCheck != null) o.put("update_check", updateCheck)
         return o
     }
 
@@ -346,6 +349,7 @@ data class CoreConfig(
                 c.optDouble("watch_sleep_pct", 50.0), c.optDouble("watch_drain_pct_h", 3.0),
                 c.optDouble("watch_wakeups_h", 600.0), c.optDouble("watch_app_ma", 10.0),
                 c.optDouble("watch_hot_c", 40.0), c.optJSONArray("watch_mute").strings(),
+                if (c.has("update_check")) c.optBoolean("update_check") else null,
             )
         }
     }

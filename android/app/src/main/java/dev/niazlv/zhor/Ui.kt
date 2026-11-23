@@ -115,6 +115,13 @@ fun ZhorApp(vm: Vm) {
     }
     val start = remember { if (vm.onboarded) "home" else "onboarding" }
     // нажали на уведомление сторожа: отчёт за тот период, поверх — приложение, если оно названо
+    // нажали на уведомление об обновлении — в настройки, там блок «Обновления»
+    LaunchedEffect(vm.pendingSettings, vm.ready) {
+        if (vm.pendingSettings && vm.ready) {
+            vm.pendingSettings = false
+            nav.navigate("settings")
+        }
+    }
     LaunchedEffect(vm.pendingAlert, vm.ready) {
         val p = vm.pendingAlert ?: return@LaunchedEffect
         if (!vm.ready) return@LaunchedEffect

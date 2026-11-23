@@ -24,6 +24,17 @@ class AlertReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         when (intent.action) {
             ACTION_ALERT -> Notify.alert(ctx, intent)
+            // ядро раз в сутки напоминает проверить новую версию (в сеть ходит только Updater)
+            ACTION_CHECK_UPDATE -> {
+                val pending = goAsync()
+                Thread {
+                    try {
+                        Updater.backgroundCheck(ctx)
+                    } finally {
+                        pending.finish()
+                    }
+                }.start()
+            }
             ACTION_MUTE -> {
                 val key = intent.getStringExtra("key") ?: return
                 val id = intent.getIntExtra("nid", 0)
@@ -43,6 +54,7 @@ class AlertReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_ALERT = "dev.niazlv.zhor.ALERT"
         const val ACTION_MUTE = "dev.niazlv.zhor.MUTE"
+        const val ACTION_CHECK_UPDATE = "dev.niazlv.zhor.CHECK_UPDATE"
     }
 }
 

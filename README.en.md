@@ -16,7 +16,7 @@ against the battery's coulomb counter and explains who, where, how much and why.
 ![root](https://img.shields.io/badge/root-KernelSU%20·%20Magisk-26221F)
 ![Rust](https://img.shields.io/badge/core-Rust-B7410E?logo=rust&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/UI-Kotlin%20·%20Compose-7F52FF?logo=kotlin&logoColor=white)
-![offline](https://img.shields.io/badge/internet-not%20needed-2BB3A3)
+![offline](https://img.shields.io/badge/internet-updates%20only-2BB3A3)
 
 **[Download APK](https://github.com/niazlv/zhor/releases/latest/download/zhor.apk)** · [Русский](README.md) · [Core API](docs/api.md) · [How it works](#how-it-works) · [Changelog](CHANGELOG.md)
 
@@ -126,6 +126,9 @@ flowchart LR
 2. Open Zhor and grant it root in KernelSU or Magisk. It copies the core to `/data/adb/zhor/bin/zhord` and
    starts it; on updates it replaces the core only if the bundled build is newer.
 3. Start on boot is a toggle in the app's settings.
+4. From then on Zhor updates itself: once a day it checks for a new version and sends a notification. It installs only
+   when you tap "Update" (Обновить): downloads the APK from GitHub, checks the checksum from `SHA256SUMS` and that the
+   signing certificate matches the installed Zhor, and installs it via root without the system install dialog.
 
 Every release is built by [GitHub Actions](https://github.com/niazlv/zhor/actions/workflows/release.yml)
 from its tag and ships with `SHA256SUMS` and a build provenance attestation. APK signing certificate, SHA-256:
@@ -201,7 +204,11 @@ shows up in the report, and the app has a "cost of Zhor itself" card.
 
 ## Privacy
 
-- The app has **no internet permission** — your data physically cannot leave the phone.
+- **Internet is used for updates only.** Once a day the app asks GitHub for the latest version number (a plain
+  request to `api.github.com`; nothing about the phone is sent) and downloads a new version when you tap the button.
+  Records and reports never leave the phone: all networking lives in one file,
+  [`Updater.kt`](android/app/src/main/java/dev/niazlv/zhor/Updater.kt). The check can be turned off in settings;
+  the `zhord` core never touches the network.
 - Everything lives in `/data/adb/zhor` and is wiped with a button in the app.
 - The core accepts requests from root only (`SO_PEERCRED` check) and writes exports only to the app's
   folder and shared storage.

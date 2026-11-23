@@ -39,6 +39,8 @@ pub struct Config {
     pub watch_hot_c: f64,
     /// «не напоминать»: ключи тревог (правило или правило:виновник)
     pub watch_mute: Vec<String>,
+    /// (0.7) раз в сутки будить приложение проверить новую версию (в сеть ходит оно, ставит — по кнопке)
+    pub update_check: bool,
 }
 
 impl Default for Config {
@@ -57,6 +59,7 @@ impl Default for Config {
             watch_app_ma: 10.0,
             watch_hot_c: 40.0,
             watch_mute: Vec::new(),
+            update_check: true,
         }
     }
 }

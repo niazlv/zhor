@@ -5,6 +5,8 @@
     <!-- метки и иконки всех приложений в отчёте -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
+    <!-- только проверка и скачивание обновлений с GitHub (Updater.kt) — больше сеть нигде не используется -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- тревоги сторожа -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -26,7 +28,7 @@
             </intent-filter>
         </activity>
 
-        <!-- тревоги сторожа: явная рассылка от ядра (root); снаружи недоступен -->
+        <!-- тревоги сторожа и напоминание проверить обновление: явная рассылка от ядра (root); снаружи недоступен -->
         <receiver
             android:name=".AlertReceiver"
             android:exported="false" />

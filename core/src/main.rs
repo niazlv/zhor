@@ -24,6 +24,7 @@ mod util;
 mod watch;
 mod compare;
 mod guard;
+mod update;
 
 use serde_json::json;
 use std::path::PathBuf;

@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 /// Каталог приложения в device-encrypted хранилище: есть, пока оно установлено (и до разблокировки).
-const APP_DIR: &str = "/data/user_de/0/dev.niazlv.zhor";
+pub const APP_DIR: &str = "/data/user_de/0/dev.niazlv.zhor";
 /// Скрипт автозапуска, который ставит приложение (Core.kt).
 pub const BOOT_SCRIPT: &str = "/data/adb/service.d/zhor.sh";
 /// Сколько приложение должно отсутствовать, чтобы считать его удалённым.

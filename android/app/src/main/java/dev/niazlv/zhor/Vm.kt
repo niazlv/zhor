@@ -34,6 +34,18 @@ sealed interface Res<out T> {
 
 fun <T> Res<T>.value(): T? = (this as? Res.Ok<T>)?.v
 
+/** Обновление приложения: от проверки до установки. */
+sealed interface Upd {
+    data object Idle : Upd
+    data object Checking : Upd
+    data object UpToDate : Upd
+    data class Available(val r: Updater.Rel) : Upd
+    data class Downloading(val r: Updater.Rel, val done: Long, val total: Long) : Upd
+    data class Verifying(val r: Updater.Rel) : Upd
+    data class Installing(val r: Updater.Rel) : Upd
+    data class Failed(val msg: String, val r: Updater.Rel?) : Upd
+}
+
 /** Отчёт по отрезку графика. */
 data class Seg(val from: Long, val to: Long, val res: Res<Report>)
 
@@ -83,6 +95,12 @@ class Vm(app: Application) : AndroidViewModel(app) {
     val actionLog = mutableStateMapOf<Int, List<ActionRec>>()
     val cmps = mutableStateMapOf<String, Res<Comparison>>()
     var acting by mutableStateOf(false)
+
+    // ---- обновления ----
+    var upd by mutableStateOf<Upd>(Updater.known(app)?.let { Upd.Available(it) } ?: Upd.Idle)
+    var updChecked by mutableStateOf(Updater.lastChecked(app))
+    /** Нажали на уведомление об обновлении — открыть настройки. */
+    var pendingSettings by mutableStateOf(false)
     /** Что ограничил Жор и что до сих пор ограничено (null — ещё не загружено или ядро старое). */
     var restricted by mutableStateOf<List<Restr>?>(null)
 
@@ -134,6 +152,7 @@ class Vm(app: Application) : AndroidViewModel(app) {
             if (ready) {
                 autostart = withContext(Dispatchers.IO) { core.autostart() }
                 refresh(fresh = true)
+                startUpdates()
             }
         }
     }
@@ -487,6 +506,83 @@ class Vm(app: Application) : AndroidViewModel(app) {
         if (uid % 100000 >= 10000) pm.getPackagesForUid(uid)?.firstOrNull()?.let { return iconOfPkg(it) }
         if (uid % 100000 == 1000) return iconOfPkg("android")
         return null
+    }
+
+    // ---- обновления ----
+
+    /** После запуска: сказать, что обновились; раз в сутки проверить новую версию, если проверка не выключена. */
+    private fun startUpdates() {
+        val app = getApplication<Application>()
+        val p = prefs.getString("upd_pending", null)
+        if (p != null) {
+            prefs.edit().remove("upd_pending").apply()
+            if (Updater.installedVersion(app) == p) toast = "Жор обновлён до $p"
+        }
+        viewModelScope.launch {
+            val c = runCatching { withContext(Dispatchers.IO) { core.config() } }.getOrNull()
+            if (c != null && config !is Res.Ok) config = Res.Ok(c)
+            if (c?.updateCheck != false && Updater.due(app)) checkUpdate(quiet = true)
+        }
+    }
+
+    fun checkUpdate(quiet: Boolean = false) {
+        if (upd is Upd.Checking || upd is Upd.Downloading || upd is Upd.Verifying || upd is Upd.Installing) return
+        val app = getApplication<Application>()
+        val before = upd
+        upd = Upd.Checking
+        viewModelScope.launch {
+            upd = try {
+                val r = withContext(Dispatchers.IO) { Updater.check(app) }
+                if (r != null) Upd.Available(r) else Upd.UpToDate
+            } catch (e: Exception) {
+                if (quiet) before else Upd.Failed("Не удалось проверить: ${e.message ?: e.javaClass.simpleName}", null)
+            }
+            updChecked = Updater.lastChecked(app)
+        }
+    }
+
+    /** Скачать, проверить и поставить — только по кнопке владельца. */
+    fun startUpdate(r: Updater.Rel) {
+        val app = getApplication<Application>()
+        upd = Upd.Downloading(r, 0, r.apkSize)
+        viewModelScope.launch {
+            try {
+                var last = 0L
+                val f = withContext(Dispatchers.IO) {
+                    Updater.download(app, r) { done, total ->
+                        if (done - last > 128 * 1024 || done == total) {
+                            last = done
+                            upd = Upd.Downloading(r, done, total)
+                        }
+                    }
+                }
+                upd = Upd.Verifying(r)
+                withContext(Dispatchers.IO) { Updater.verify(app, f, r) }
+                upd = Upd.Installing(r)
+                prefs.edit().putString("upd_pending", r.version).commit()
+                // при успехе система закроет приложение прямо здесь, ядро откроет новую версию
+                val (ok, out) = try {
+                    withContext(Dispatchers.IO) { core.installApk(f.absolutePath) }
+                } catch (e: Unsupported) {
+                    throw e
+                } catch (e: Exception) {
+                    throw IllegalStateException("Ядро не поставило обновление: ${e.message ?: e.javaClass.simpleName}")
+                }
+                if (!ok) {
+                    prefs.edit().remove("upd_pending").apply()
+                    upd = Upd.Failed("Android не поставил обновление: ${out.ifBlank { "нет ответа" }}", r)
+                }
+            } catch (e: Unsupported) {
+                upd = Upd.Failed("Ставить обновления умеет ядро 0.7 и новее. Скачайте APK со страницы выпуска.", r)
+            } catch (e: Exception) {
+                upd = Upd.Failed(e.message ?: e.javaClass.simpleName, r)
+            }
+        }
+    }
+
+    fun setUpdateCheck(on: Boolean) {
+        val c = config.value() ?: return
+        saveConfig(c.copy(updateCheck = on))
     }
 
     // ---- (0.6) сторож ----

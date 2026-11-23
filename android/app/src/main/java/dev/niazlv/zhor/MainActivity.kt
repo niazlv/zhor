@@ -26,6 +26,11 @@ class MainActivity : ComponentActivity() {
 
     /** Нажали на уведомление сторожа — открыть отчёт за тот период (и приложение, если оно названо). */
     private fun handle(i: Intent?) {
+        if (i?.getStringExtra(Notify.EXTRA_OPEN) == "update") {
+            vm.pendingSettings = true
+            i.removeExtra(Notify.EXTRA_OPEN)
+            return
+        }
         if (i?.getStringExtra(Notify.EXTRA_OPEN) != "alert") return
         val from = i.getLongExtra("from", 0)
         val to = i.getLongExtra("to", 0)
