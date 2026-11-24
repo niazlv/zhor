@@ -146,11 +146,23 @@ pub struct WakeupSources {
     dirs: Vec<(String, String)>,
     prev: HashMap<String, WsCounters>,
     last_enum_ms: u64,
+    /// Подписи источников epoll («[timerfd] system_server · смена часов») по номеру wakeupN.
+    owners: HashMap<u64, String>,
+    /// Номера источников epoll, для которых сняты `owners`: пока набор тот же, /proc не сканируем.
+    owners_ids: Vec<u64>,
+    owners_tries: u8,
 }
 
 impl WakeupSources {
     pub fn new() -> Self {
-        let mut w = WakeupSources { dirs: Vec::new(), prev: HashMap::new(), last_enum_ms: 0 };
+        let mut w = WakeupSources {
+            dirs: Vec::new(),
+            prev: HashMap::new(),
+            last_enum_ms: 0,
+            owners: HashMap::new(),
+            owners_ids: Vec::new(),
+            owners_tries: 0,
+        };
         w.enumerate(0);
         w
     }
@@ -159,17 +171,35 @@ impl WakeupSources {
         self.last_enum_ms = now;
         self.dirs.clear();
         let Ok(rd) = std::fs::read_dir("/sys/class/wakeup") else { return };
-        let mut seen: HashMap<String, u32> = HashMap::new();
-        let mut v: Vec<String> = rd.filter_map(|e| e.ok()).map(|e| e.path().to_string_lossy().into_owned()).collect();
+        // по номеру, а не по строке пути: wakeup76 раньше wakeup100, номера «#N» не скачут
+        let mut v: Vec<(u64, String, String)> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let id = e.file_name().to_str().and_then(|s| s.strip_prefix("wakeup")).and_then(|s| s.parse().ok());
+                let p = e.path().to_string_lossy().into_owned();
+                let mut name = util::read_str(format!("{p}/name")).unwrap_or_default();
+                if name.is_empty() {
+                    name = "<без имени>".into();
+                }
+                (id.unwrap_or(u64::MAX), p, name)
+            })
+            .collect();
         v.sort();
-        for p in v {
-            let mut name = util::read_str(format!("{p}/name")).unwrap_or_default();
-            if name.is_empty() {
-                name = "<без имени>".into();
-            }
-            let n = seen.entry(name.clone()).or_insert(0);
+        let epoll: Vec<(u64, &str)> = v.iter().filter(|x| is_epoll_ws(&x.2)).map(|x| (x.0, x.2.as_str())).collect();
+        let ids: Vec<u64> = epoll.iter().map(|x| x.0).collect();
+        // счёт не сошёлся (демон как раз перезапускался) — ещё пара попыток на следующих перечислениях
+        let incomplete = self.owners.len() < self.owners_ids.len() && self.owners_tries < 3;
+        if ids != self.owners_ids || incomplete {
+            self.owners_tries = if ids != self.owners_ids { 1 } else { self.owners_tries + 1 };
+            self.owners = if ids.is_empty() { HashMap::new() } else { match_owners(&epoll, &scan_epoll_wakeups()) };
+            self.owners_ids = ids;
+        }
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        for (id, p, name) in v {
+            let base = self.owners.get(&id).cloned().unwrap_or(name);
+            let n = seen.entry(base.clone()).or_insert(0);
             *n += 1;
-            let key = if *n > 1 { format!("{name} #{n}") } else { name };
+            let key = if *n > 1 { format!("{base} #{n}") } else { base };
             self.dirs.push((p, key));
         }
     }
@@ -207,6 +237,155 @@ impl WakeupSources {
         }
         out
     }
+}
+
+// ── Владельцы источников пробуждения epoll ──────────────────────────────────────────────────────
+//
+// Файл, добавленный в epoll с флагом EPOLLWAKEUP, получает свой источник пробуждения. Ядро называет
+// его именем файла («[timerfd]», «[eventfd]») и не говорит, чей он, — отсюда девять одинаковых
+// «[timerfd]». Владельца восстанавливаем по порядку: номера wakeupN ядро выдаёт по возрастанию, а
+// такие таймеры заводят привилегированные демоны при старте. Записи epoll с EPOLLWAKEUP из
+// /proc/*/fdinfo сортируем по (старт процесса, pid, fd) и сопоставляем источникам с тем же именем
+// по номеру — только если их ровно столько же; иначе подпись не ставим, остаётся «#N».
+// Проверено на Xiaomi 15 Ultra: 9 «[timerfd]» = 6 таймеров AlarmManager (system_server) +
+// 2 audioserver + 1 HAL; у таймера смены часов wakeup_count совпал с числом засыпаний.
+
+const EPOLLWAKEUP: u32 = 1 << 29;
+const TFD_TIMER_CANCEL_ON_SET: u32 = 2;
+
+/// Источник пробуждения от epoll: имя анонимного файла в квадратных скобках.
+fn is_epoll_ws(name: &str) -> bool {
+    name.len() > 2 && name.starts_with('[') && name.ends_with(']')
+}
+
+/// Файл в epoll с EPOLLWAKEUP: под него ядро держит источник пробуждения `name`.
+#[derive(Debug, Clone)]
+struct EpWake {
+    start: u64,
+    pid: u32,
+    fd: u32,
+    name: String,
+    label: String,
+}
+
+/// Строки «tfd: N events: X …» из fdinfo epoll → (fd, маска событий).
+fn parse_epoll_fdinfo(info: &str) -> Vec<(u32, u32)> {
+    info.lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            if it.next()? != "tfd:" {
+                return None;
+            }
+            let fd = it.next()?.parse().ok()?;
+            if it.next()? != "events:" {
+                return None;
+            }
+            Some((fd, u32::from_str_radix(it.next()?, 16).ok()?))
+        })
+        .collect()
+}
+
+/// Что за таймер, по fdinfo timerfd. У system_server это таймеры AlarmManager: по одному на тип
+/// будильника и ещё один, который ядро дёргает при смене часов и на каждом выходе из сна.
+fn timer_what(owner: &str, info: &str) -> &'static str {
+    let mut clock = -1i64;
+    let mut flags = 0u32;
+    for l in info.lines() {
+        if let Some(v) = l.strip_prefix("clockid:") {
+            clock = v.trim().parse().unwrap_or(-1);
+        } else if let Some(v) = l.strip_prefix("settime flags:") {
+            flags = u32::from_str_radix(v.trim(), 8).unwrap_or(0);
+        }
+    }
+    let am = owner == "system_server";
+    match clock {
+        _ if flags & TFD_TIMER_CANCEL_ON_SET != 0 => "смена часов",
+        9 if am => "будильники с пробуждением",
+        9 => "будит",
+        8 if am => "будильники по часам с пробуждением",
+        8 => "будит по часам",
+        7 if am => "будильники без пробуждения",
+        0 if am => "будильники по часам без пробуждения",
+        7 | 0 | 1 => "таймер без пробуждения",
+        _ => "таймер",
+    }
+}
+
+/// Время старта процесса (тики) и его имя: первое слово cmdline без пути, иначе comm.
+fn proc_owner(pid: u32) -> (u64, String) {
+    let stat = util::read_str(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let (comm, rest) = match (stat.find('('), stat.rfind(')')) {
+        (Some(l), Some(r)) if l < r => (&stat[l + 1..r], stat.get(r + 2..).unwrap_or("")),
+        _ => ("", ""),
+    };
+    // поля после ')': 0=state … 19=starttime
+    let start = rest.split(' ').nth(19).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let first = String::from_utf8_lossy(cmd.split(|&c| c == 0).next().unwrap_or(&[])).trim().to_string();
+    let first = first.split_whitespace().next().unwrap_or("");
+    let name = first.rsplit('/').next().unwrap_or("");
+    (start, if name.is_empty() { comm.to_string() } else { name.to_string() })
+}
+
+/// Все файлы в epoll с EPOLLWAKEUP по всем процессам. Читает fd всех процессов (~0,1–0,3 с), поэтому
+/// зовётся только когда меняется набор источников epoll.
+fn scan_epoll_wakeups() -> Vec<EpWake> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    for e in rd.filter_map(|e| e.ok()) {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        let mut owner: Option<(u64, String)> = None;
+        // один экземпляр epoll под двумя номерами fd (dup) дал бы лишние записи
+        let mut seen: Vec<Vec<(u32, u32)>> = Vec::new();
+        for f in fds.filter_map(|f| f.ok()) {
+            let Ok(t) = std::fs::read_link(f.path()) else { continue };
+            if t.as_os_str() != "anon_inode:[eventpoll]" {
+                continue;
+            }
+            let Some(fd) = f.file_name().to_str().map(str::to_string) else { continue };
+            let Some(info) = util::read_str(format!("/proc/{pid}/fdinfo/{fd}")) else { continue };
+            let items: Vec<(u32, u32)> = parse_epoll_fdinfo(&info).into_iter().filter(|x| x.1 & EPOLLWAKEUP != 0).collect();
+            if items.is_empty() || seen.contains(&items) {
+                continue;
+            }
+            for &(tfd, _) in &items {
+                let Ok(target) = std::fs::read_link(format!("/proc/{pid}/fd/{tfd}")) else { continue };
+                let target = target.to_string_lossy();
+                let Some(name) = target.strip_prefix("anon_inode:") else { continue };
+                let (start, who) = owner.get_or_insert_with(|| proc_owner(pid)).clone();
+                let label = if name == "[timerfd]" {
+                    let info = util::read_str(format!("/proc/{pid}/fdinfo/{tfd}")).unwrap_or_default();
+                    format!("{name} {who} · {}", timer_what(&who, &info))
+                } else {
+                    format!("{name} {who}")
+                };
+                out.push(EpWake { start, pid, fd: tfd, name: name.to_string(), label });
+            }
+            seen.push(items);
+        }
+    }
+    out
+}
+
+/// Подписи источникам epoll: `ws` — (номер wakeupN, имя) по возрастанию номера.
+fn match_owners(ws: &[(u64, &str)], items: &[EpWake]) -> HashMap<u64, String> {
+    let mut out = HashMap::new();
+    let mut names: Vec<&str> = ws.iter().map(|x| x.1).collect();
+    names.sort_unstable();
+    names.dedup();
+    for n in names {
+        let ids: Vec<u64> = ws.iter().filter(|x| x.1 == n).map(|x| x.0).collect();
+        let mut it: Vec<&EpWake> = items.iter().filter(|x| x.name == n).collect();
+        if it.len() != ids.len() {
+            continue; // счёт не сошёлся — порядок ничего не доказывает
+        }
+        it.sort_by_key(|x| (x.start, x.pid, x.fd));
+        for (id, w) in ids.iter().zip(it) {
+            out.insert(*id, w.label.clone());
+        }
+    }
+    out
 }
 
 /// Сон: число удачных/неудачных засыпаний и последняя причина пробуждения.
@@ -263,4 +442,53 @@ pub fn gpu_busy() -> Option<(u64, u64)> {
     let total = b.max(1);
     let busy = a.min(total);
     Some((BUSY.fetch_add(busy, Ordering::Relaxed) + busy, TOTAL.fetch_add(total, Ordering::Relaxed) + total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // fdinfo с Xiaomi 15 Ultra (system_server, AlarmManager)
+    const EP: &str = "pos:\t0\nflags:\t02\nmnt_id:\t13\nino:\t2052\n\
+tfd:      308 events: 20000019 data:                1  pos:0 ino:804 sdev:e\n\
+tfd:      309 events: 20000019 data:                2  pos:0 ino:804 sdev:e\n\
+tfd:      307 events: 20000019 data:                0  pos:0 ino:804 sdev:e\n\
+tfd:       40 events:       19 data:                9  pos:0 ino:804 sdev:e\n";
+
+    #[test]
+    fn epoll_fdinfo() {
+        let v = parse_epoll_fdinfo(EP);
+        assert_eq!(v, vec![(308, 0x2000_0019), (309, 0x2000_0019), (307, 0x2000_0019), (40, 0x19)]);
+        assert_eq!(v.iter().filter(|x| x.1 & EPOLLWAKEUP != 0).count(), 3);
+    }
+
+    #[test]
+    fn timer_kinds() {
+        let t = |c: u32, f: &str| format!("clockid: {c}\nticks: 0\nsettime flags: {f}\nit_value: (0, 0)\n");
+        assert_eq!(timer_what("system_server", &t(0, "03")), "смена часов");
+        assert_eq!(timer_what("system_server", &t(9, "01")), "будильники с пробуждением");
+        assert_eq!(timer_what("system_server", &t(7, "01")), "будильники без пробуждения");
+        assert_eq!(timer_what("system_server", &t(1, "00")), "таймер без пробуждения");
+        assert_eq!(timer_what("audioserver", &t(9, "01")), "будит");
+        assert_eq!(timer_what("audioserver", &t(7, "00")), "таймер без пробуждения");
+        assert!(is_epoll_ws("[timerfd]") && !is_epoll_ws("qcom_rx_wakelock") && !is_epoll_ws("[]"));
+    }
+
+    fn w(start: u64, pid: u32, fd: u32, label: &str) -> EpWake {
+        EpWake { start, pid, fd, name: "[timerfd]".into(), label: label.into() }
+    }
+
+    #[test]
+    fn owners_by_order() {
+        let ws = [(76, "[timerfd]"), (81, "[timerfd]"), (100, "[timerfd]"), (101, "[eventfd]")];
+        // порядок записей не важен: сортируются по (старт, pid, fd)
+        let items = [w(6670, 3827, 312, "C"), w(6447, 2408, 7, "A"), w(6670, 3827, 307, "B")];
+        let m = match_owners(&ws, &items);
+        assert_eq!(m.get(&76).map(String::as_str), Some("A"));
+        assert_eq!(m.get(&81).map(String::as_str), Some("B"));
+        assert_eq!(m.get(&100).map(String::as_str), Some("C"));
+        assert!(!m.contains_key(&101), "[eventfd] без записей — без подписи");
+        // одной записи не хватает — подписей нет совсем, а не со сдвигом
+        assert!(match_owners(&ws, &items[..2]).is_empty());
+    }
 }
