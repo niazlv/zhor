@@ -75,6 +75,11 @@ Zhor is rebuilt on what modern kernels and Android actually provide, and answers
   draining right then; a range opens as a full report.
 - **Android history.** batterystats events (wakelocks, jobs, syncs, screen, doze) to the millisecond —
   as a per-app timeline.
+- **Who wakes it over the network.** How many packets each app received while the screen was off, and how often
+  incoming packets woke the CPU — finds the messenger that downloads media all night or a chatty VPN.
+- **Profiles and groups.** Your own app groups ("Banks", "Messengers", "Deals and promos") and profiles: "Saver",
+  "Abroad" (by the carrier network country), night, or your own manual one. Per group: leave alone, only if it eats a
+  lot, restrict background, or hard. No "ultra" mode, and all of it can be undone.
 - **Watchdog.** A notification while the problem is happening, not the next morning: the phone does not sleep,
   the battery melts while idle, something wakes the CPU thousands of times an hour, an app keeps working in the
   background, the phone heats up in a pocket. Thresholds are adjustable, noise can be muted. Checks run on the
@@ -221,6 +226,10 @@ Only what you tapped yourself, and all of it can be undone:
 - **Restrict background** is Android's standard restriction (`RUN_ANY_IN_BACKGROUND`); lift it with the button on the app
   card, with «Вернуть всё» (undo all) on the Watchdog screen, or in the app's battery settings. It restores the mode the app had
   before Zhor and leaves alone anything you changed since. Without the app: `zhord revert-all`.
+- **Profiles** restrict background, stop, cut network (own iptables chain `zhor_out` by uid) or disable a package
+  (`pm disable-user`) — only for apps in your groups, by your rules (and heavy eaters, if set so). When a profile turns
+  off, everything is restored: packages enabled, the chain removed; undo all lifts it too. System apps, the
+  keyboard, calls, SMS, Google services, VPN and root apps are never touched.
 - **Detailed Android history** is only on if you enable it; Android also resets it on reboot.
 - **Uninstalled the app?** Within 10 minutes the core lifts its restrictions, turns detailed history off, removes its
   autostart script and stops. Records stay in `/data/adb/zhor` — delete them in the app before uninstalling, or by hand.

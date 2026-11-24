@@ -93,6 +93,9 @@ class Navi(val nav: NavHostController) {
     fun guide(term: String? = null) = go(if (term == null) "guide" else "guide?term=$term")
     fun onboarding() = go("onboarding")
     fun watch() = go("watch")
+    fun modes() = go("modes")
+    fun mprofile(id: String) = go("mprofile/$id")
+    fun mgroup(id: String) = go("mgroup/$id")
     fun compare(r: CmpReq) = go("compare?mode=${r.mode}&t=${r.t ?: 0}&uid=${r.uid ?: -1}")
     fun back() {
         if (nav.previousBackStackEntry != null) nav.popBackStack()
@@ -161,6 +164,13 @@ fun ZhorApp(vm: Vm) {
                 ) { e -> SegmentScreen(vm, navi, e.arguments?.getLong("from") ?: 0, e.arguments?.getLong("to") ?: 0) }
                 composable("settings") { SettingsScreen(vm, navi) }
                 composable("watch") { WatchScreen(vm, navi) }
+                composable("modes") { ModesScreen(vm, navi) }
+                composable("mprofile/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { e ->
+                    ProfileScreen(vm, navi, e.arguments?.getString("id") ?: "")
+                }
+                composable("mgroup/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { e ->
+                    GroupScreen(vm, navi, e.arguments?.getString("id") ?: "")
+                }
                 composable(
                     "compare?mode={mode}&t={t}&uid={uid}",
                     arguments = listOf(

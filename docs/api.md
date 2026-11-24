@@ -280,6 +280,89 @@ CLI: `zhord alerts`, `zhord alert-test`, `zhord watch-check [--days N] [--fast]`
                   "alarms_h","wakelock_min_h","jobs_h","mah_h"}}   // Android, весь отрезок (report с uid)
   ```
 
+### Группы и профили (0.8)
+
+Настройки — `modes.json` в каталоге данных:
+
+```text
+{"groups":[{"id":"keep","name":"Важное","members":[uid…]},       // keep — встроенная, профили её не трогают
+           {"id":"banks","name":"Банки","members":[10123,1010123],   // uid с пользователем; приложение — в любом числе групп
+            "packages":["com.miui.analytics"],                         // и пакеты по имени — во всех пространствах, в т. ч. uid 1000
+            "components":["com.miui.securitycenter/io.appmetrica.analytics.internal.AppMetricaService"]}],  // компоненты
+ "profiles":[{"id":"abroad","name":"За границей","on":true,
+              "when":{"manual":false,"always":false,"saver":false,"below_pct":0,"abroad":true,
+                      "night":false,"night_from":1380,"night_to":420},  // достаточно любого условия; минуты местного времени
+              "rules":{"banks":"watch","promo":"hard","rest":"none"},     // id группы или rest («все остальные») → уровень
+              "apps":{"10123":"bg"},                                      // своё правило приложения поверх групп
+              "heavy_ma":5.0,"heavy_rx_h":2000,"idle_h":3}],              // «много ест»
+ "home_country":"",                                                       // пусто — страна первой SIM
+ "presets":["xiaomi_spy","xiaomi_opt","privacy","xiaomi_appmetrica"]}    // заготовки, которые уже добавлялись
+```
+
+- Уровни: `none` — не трогать; `watch` — только если много ест; `bg` — запрет фона (appop `RUN_ANY_IN_BACKGROUND`
+  ignore); `hard` — запрет фона и `force-stop` при каждом выключении экрана (и снова раз в 30 мин, если поднялось);
+  `nonet` — как `hard` и без сети; `disable` — `pm disable-user --user N <pkg>` (возврат — `pm enable --user N`).
+  Системным пакетам с общим uid (1000) из `packages` доступно только `disable`; «все остальные» (`rest`) не может быть
+  `nonet`/`disable` — это весь телефон.
+- Компоненты (`components`, «пакет/класс»): только `disable` — `pm disable --user N pkg/класс` в каждом пространстве, где
+  есть пакет, возврат `pm enable`; состояние читается из `dumpsys package <pkg>` (`disabledComponents` пользователя).
+  Пакет при этом не трогается, даже защищённый. В журнале — `cdisable`/`cenable`, в ответе `modes` — `"components":[Restr]`.
+  Заготовка `xiaomi_appmetrica` добавляет в группу `xiaomi_spy` Yandex AppMetrica внутри «Безопасности»
+  (`AppMetricaService`, `PreloadInfoContentProvider`).
+- «Без сети»: своя цепочка `zhor_out` в iptables и ip6tables, переход первым в `OUTPUT`, правило
+  `-m owner --uid-owner <uid> -j REJECT` на копию приложения. `cmd connectivity set-package-networking-enabled`
+  (FIREWALL_CHAIN_OEM_DENY_3) не подходит: берёт uid пакета только основного пользователя. После перезагрузки правил
+  нет — ядро ставит заново, пока правило действует; пустая цепочка удаляется целиком.
+- Заготовки (добавляются один раз, удалённая не возвращается): группа `xiaomi_spy` «Слежка и реклама Xiaomi»
+  (com.miui.analytics, com.miui.msa.global, com.miui.misightservice, com.miui.bugreport, com.bsp.catchlog,
+  com.xiaomi.mipicks, com.xiaomi.discover, com.xiaomi.glgm), группа `xiaomi_opt` «Xiaomi: по желанию» (joyose, xmsf,
+  xmsfkeeper, aicr, aiservice — без правил) и профиль `privacy` «Приватность» (`xiaomi_spy` → `disable`), который сам
+  не включается.
+- Правило приложения в профиле: своё (`apps`) → самое мягкое из правил его групп, у которых в этом профиле правило есть
+  (белый список сильнее чёрного) → `rest`. Между активными профилями — самое строгое. Группа `keep` и защищённые пакеты
+  не трогаются никогда.
+- Условия: `saver` — `settings get global low_power` = 1, `below_pct` — заряд не выше; оба — только не на зарядке.
+  `abroad` — страна сети (`getprop gsm.operator.iso-country`, первая непустая; без сети — последняя известная) не равна
+  домашней. Ядро читает их раз в минуту вне замка.
+- `watch`: при выключенном экране раз в 5 мин по корзинам последних 30 мин покоя (нужно ≥ 20 мин): CPU приложения в
+  фоне ≥ `heavy_ma` мА или входящих пакетов в час ≥ `heavy_rx_h` (корзины `net`), на экране не было ≥ `idle_h` (история
+  Android должна покрывать этот срок), процесс жив → `force-stop` (`by:"watch"`), запрет фона до конца профиля, тревога
+  `rule:"watch"` (ключ «не напоминать» `watch:<pkg>`).
+- Остановка пропускается, если у приложения служба переднего плана типа музыка, звонок, навигация, подключённое
+  устройство, камера, микрофон. Защищены: Жор, `android`, SystemUI, телефон, настройки, shell, Google Play и сервисы
+  Google, сетевой стек, Bluetooth, NFC, держатели ролей HOME/SMS/DIALER/ASSISTANT, клавиатура, менеджеры root,
+  `com.android.providers.*`, «Безопасность» Xiaomi (securitycenter, securitycore — держит второе пространство),
+  com.lbe.security.miui, powerkeeper, удалённая SIM (uimremote*).
+  VPN-клиенты (пакеты с `android.net.VpnService`) защищены мягко: правило «все остальные» их не трогает, но если пакет
+  сами положили в группу или дали ему своё правило — оно действует (у GetApps есть VPN-служба «ускорителя игр»).
+  Так же и предустановленные приложения (`pm list packages -s`): «все остальные» — это только ваши приложения, системные
+  Google и производителя трогают лишь явные группы и свои правила.
+- Выход приложения из-под правил (профиль выключился, правило сняли) возвращает всё, что ограничили профили
+  (`unrestrict` с `by:"mode"`); если режим с тех пор поменяли без Жора — не трогает и пишет, что отпустил.
+- `{"cmd":"modes","installed"?:true}` → `{"modes":{…},"state":{"active":[{"id","name","why":[…],"since"}],"saver",
+  "country","home","abroad"},"effective":[{"uid","pkg"?,"level","profile","tripped"?}],"protected":[pkg…],
+  "claims":[Restr],"disabled":[Restr],"nonet":[Restr],"log":[Action с by mode|watch],"packages":{"uid":[pkg…]},
+  "present":{"pkg":[uid…]},"installed"?:{"uid":[pkg…]}}`; у Restr поле `kind`: bg | disable | nonet.
+- `{"cmd":"modes_set","modes":{…}}` — всё целиком; `{"cmd":"app_group","uid","group","on":bool}`;
+  `{"cmd":"app_rule","uid","profile","level":"none|watch|bg|hard|"}` (пусто — как у групп). Ответ — как у `modes`.
+  После изменения ядро пересматривает профили сразу.
+- В журнале действий поле `by`: пусто — вручную, `mode` — профили, `watch` — «много ест»; действия `disable`/`enable`
+  и `nonet`/`net` рядом с `restrict`/`unrestrict`. `revert_all` возвращает всё: фон, отключённые пакеты, сеть.
+
+### Сеть по приложениям (0.8)
+
+- Ядро снимает `dumpsys netstats` (раздел BPF `mAppUidStatsMap`: байты и пакеты по uid с загрузки) раз в 5 мин и на
+  каждой смене экрана/зарядки; разность — в корзине: `"net":[{"u":uid,"rp","rb","tp","tb"}]`. Так разность всегда
+  относится к одному состоянию.
+- `report.net_wakers` = `{"idle_ms","since","wifi_wakeups","mobile_wakeups","rx_packets","apps":[{"uid","label","packages",
+  "kind","rx_packets","rx_bytes","tx_packets","tx_bytes","rx_per_hour","share","vpn"?}]}` — только покой (экран выкл, без
+  зарядки). Пробуждения — наибольший из сетевых источников пробуждения в корзине (`qcom_rx_wakelock` и т. п. для Wi-Fi,
+  `IPA_WS`/`rmnet_*` для мобильной сети). VPN-клиенты (пакеты с `android.net.VpnService`) в долях не участвуют.
+  У приложения — `apps[].net_idle` с теми же полями.
+- `apps[].parts` (только uid 1000) = `[{"key","title","explain","mah","mah_screen_off","share","top":[[имя,мА·ч]]}]`;
+  `key`: screen | suspend | server_binder | server_own | systemui | sensors | security | vendor | other | noncpu.
+- `system_work.server_mah`, `server_cpu_ms` — весь system_server за окно отчёта по записям ядра.
+
 ### Обновления (0.7)
 
 В сеть ходит только приложение (`Updater.kt`): `GET https://api.github.com/repos/niazlv/zhor/releases/latest`, скачивание

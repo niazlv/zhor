@@ -54,16 +54,17 @@ private fun callerName(vm: Vm, c: SysCaller, seg: String?): String = when (c.uid
 fun SystemWorkCard(r: Report, sw: SystemWork, vm: Vm, navi: Navi, seg: String?) {
     val sysApp = r.app(1000)
     Section(
-        "За кого работает system", sub = "system_server почти всё время работает по заказу других",
+        "За кого работает system", sub = "запросы к system_server — их Android раскладывает по заказчикам",
         help = "system_work", icon = Icons.Outlined.Hub,
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             MetricTile("Работа system_server", Fmt.mah(sw.mahTotal), Modifier.weight(1f), unit = "мА·ч", sub = "CPU ${Fmt.dur(sw.totalMs.toLong())}")
             val own = if (sw.totalMs > 0) 100 * sw.ownMs / sw.totalMs else 0.0
-            MetricTile("По заказу других", Fmt.pctRaw(100 - own), Modifier.weight(1f), unit = "%", sub = "сама система — ${Fmt.pctRaw(own)} %")
+            MetricTile("Из них по заказу", Fmt.pctRaw(100 - own), Modifier.weight(1f), unit = "%", sub = "сама система — ${Fmt.pctRaw(own)} %")
         }
         Explain(
             "Эти мА·ч — часть расхода «Android OS»" + (sysApp?.let { " (${Fmt.mah(it.mah)} мА·ч)" } ?: "") +
+                (if (sw.serverMah > 0) ", и даже не весь system_server (${Fmt.mah(sw.serverMah)} мА·ч)" else "") +
                 ", а не прибавка: ниже видно, кто заставил систему их потратить. Окно — ${Fmt.span(sw.from, sw.to)}.",
         )
         Spacer(Modifier.height(10.dp))

@@ -37,6 +37,9 @@ pub struct Action {
     pub prev: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub out: String,
+    /// (0.8) кто сделал: "" — вручную из карточки, mode — экономный режим, clean — авто-уборка
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
 }
 
 fn valid_pkg(p: &str) -> bool {
@@ -129,11 +132,44 @@ pub fn act(dir: &Path, pkg: &str, uid: Option<u32>, action: &str) -> Value {
         },
         other => return json!({"error": format!("неизвестное действие {other}")}),
     };
-    let a = Action { t: util::real_ms(), pkg: pkg.into(), uid, action: action.into(), ok, prev, out: out.trim().chars().take(300).collect() };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("actions.jsonl")) {
-        let _ = writeln!(f, "{}", serde_json::to_string(&a).unwrap_or_default());
-    }
+    let a = Action { t: util::real_ms(), pkg: pkg.into(), uid, action: action.into(), ok, prev, out: out.trim().chars().take(300).collect(), by: String::new() };
+    journal(dir, &a);
     json!({"ok": ok, "action": a, "state": app_state(pkg, uid)})
+}
+
+fn journal(dir: &Path, a: &Action) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("actions.jsonl")) {
+        let _ = writeln!(f, "{}", serde_json::to_string(a).unwrap_or_default());
+    }
+}
+
+/// (0.8) Запретить фон от имени режима или авто-уборки. None — фон и так запрещён (не наше, не пишем).
+pub fn restrict_by(dir: &Path, pkg: &str, uid: Option<u32>, by: &str) -> Option<Action> {
+    if !valid_pkg(pkg) || pkg == crate::watch::APP_PKG {
+        return None;
+    }
+    let user = user_of(uid);
+    let prev = bg_mode_sure(pkg, &user);
+    if matches!(prev.as_deref(), Some("ignore") | Some("deny")) {
+        return None;
+    }
+    let out = util::run_cmd("cmd", &["appops", "set", "--user", &user, pkg, "RUN_ANY_IN_BACKGROUND", "ignore"], 10_000).unwrap_or_default();
+    let ok = bg_mode_sure(pkg, &user).as_deref() == Some("ignore");
+    let a = Action { t: util::real_ms(), pkg: pkg.into(), uid, action: "restrict".into(), ok, prev, out: out.trim().chars().take(300).collect(), by: by.into() };
+    journal(dir, &a);
+    Some(a)
+}
+
+/// (0.8) Остановить приложение от имени режима или авто-уборки; `why` — в журнал.
+pub fn stop_by(dir: &Path, pkg: &str, uid: Option<u32>, by: &str, why: &str) -> Action {
+    let user = user_of(uid);
+    let (ok, out) = match util::run_cmd("cmd", &["activity", "force-stop", "--user", &user, pkg], 15_000) {
+        Some(o) => (true, format!("{why} {}", o.trim())),
+        None => (false, format!("{why} — cmd activity force-stop не запустился")),
+    };
+    let a = Action { t: util::real_ms(), pkg: pkg.into(), uid, action: "stop".into(), ok, prev: None, out: out.trim().chars().take(300).collect(), by: by.into() };
+    journal(dir, &a);
+    a
 }
 
 /// Весь журнал действий по порядку (без отсечки по сроку — по нему возвращаются ограничения).
@@ -146,7 +182,7 @@ fn all_actions(dir: &Path) -> Vec<Action> {
 }
 
 /// Ограничение, которое поставил Жор и которое до сих пор действует.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Restr {
     pub pkg: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +191,12 @@ pub struct Restr {
     pub since: i64,
     /// режим работы в фоне до Жора — в него и вернём
     pub prev: String,
+    /// (0.8) кто ограничил: "" — вручную, mode — профили
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    /// (0.8) что именно: bg — запрет фона, disable — пакет отключён, nonet — без сети
+    #[serde(default)]
+    pub kind: &'static str,
 }
 
 /// Из журнала: кого Жор ограничил и не вернул. Первое «ограничить» серии хранит режим до Жора; если и тогда
@@ -166,7 +208,7 @@ fn claimed(all: &[Action]) -> Vec<Restr> {
         match a.action.as_str() {
             "restrict" if e.is_none() => {
                 let prev = a.prev.clone().unwrap_or_else(|| "allow".into());
-                *e = Some(Restr { pkg: a.pkg.clone(), uid: a.uid, since: a.t, prev });
+                *e = Some(Restr { pkg: a.pkg.clone(), uid: a.uid, since: a.t, prev, by: a.by.clone(), kind: "bg" });
             }
             "unrestrict" => *e = None,
             _ => {}
@@ -181,33 +223,342 @@ pub fn restricted(dir: &Path) -> Vec<Restr> {
     claimed(&all_actions(dir)).into_iter().filter(|r| bg_mode(&r.pkg, &user_of(r.uid)).as_deref() == Some("ignore")).collect()
 }
 
-/// Вернуть всё, что ограничил Жор, в режим до него. Каждый возврат пишется в журнал как «unrestrict».
+/// (0.8) Все ограничения фона Жора по журналу (без проверки текущего режима).
+pub fn claims(dir: &Path) -> Vec<Restr> {
+    claimed(&all_actions(dir))
+}
+
+/// Пары действий «включил / вернул» из журнала: что Жор сделал и не вернул (по пакету и uid).
+fn claimed_pair(all: &[Action], on: &str, off: &str, kind: &'static str) -> Vec<Restr> {
+    let mut state: std::collections::BTreeMap<(String, Option<u32>), Option<Restr>> = std::collections::BTreeMap::new();
+    for a in all.iter().filter(|a| a.ok) {
+        let e = state.entry((a.pkg.clone(), a.uid)).or_insert(None);
+        if a.action == on && e.is_none() {
+            *e = Some(Restr { pkg: a.pkg.clone(), uid: a.uid, since: a.t, prev: a.prev.clone().unwrap_or_default(), by: a.by.clone(), kind });
+        } else if a.action == off {
+            *e = None;
+        }
+    }
+    state.into_values().flatten().collect()
+}
+
+/// (0.8) Пакеты, которые Жор отключил (`pm disable-user`) и не включил обратно.
+pub fn disable_claims(dir: &Path) -> Vec<Restr> {
+    claimed_pair(&all_actions(dir), "disable", "enable", "disable")
+}
+
+/// (0.8) Компоненты, которые Жор отключил (`pm disable pkg/класс`) и не включил обратно.
+pub fn comp_claims(dir: &Path) -> Vec<Restr> {
+    claimed_pair(&all_actions(dir), "cdisable", "cenable", "component")
+}
+
+/// (0.8) Приложения, которым Жор закрыл сеть и не открыл.
+pub fn nonet_claims(dir: &Path) -> Vec<Restr> {
+    claimed_pair(&all_actions(dir), "nonet", "net", "nonet")
+}
+
+// ---- (0.8) отключить пакет ----
+
+/// Отключён ли пакет у пользователя (`pm list packages -d`). None — не прочиталось.
+fn pkg_disabled(pkg: &str, user: &str) -> Option<bool> {
+    let t = util::run_cmd("pm", &["list", "packages", "-d", "--user", user], 20_000)?;
+    Some(t.lines().any(|l| l.trim().strip_prefix("package:") == Some(pkg)))
+}
+
+/// Отключить пакет у пользователя копии (uid). None — и так отключён (не наше, не пишем).
+pub fn disable_by(dir: &Path, pkg: &str, uid: Option<u32>, by: &str, why: &str) -> Option<Action> {
+    if !valid_pkg(pkg) || pkg == crate::watch::APP_PKG || pkg == "android" {
+        return None;
+    }
+    let user = user_of(uid);
+    if pkg_disabled(pkg, &user) == Some(true) {
+        return None;
+    }
+    let out = util::run_cmd("pm", &["disable-user", "--user", &user, pkg], 30_000).unwrap_or_default();
+    let ok = pkg_disabled(pkg, &user) == Some(true);
+    let a = Action { t: util::real_ms(), pkg: pkg.into(), uid, action: "disable".into(), ok, prev: Some("enabled".into()), out: format!("{why} {}", out.trim()).trim().chars().take(300).collect(), by: by.into() };
+    journal(dir, &a);
+    Some(a)
+}
+
+/// Включить обратно пакет, который отключил Жор.
+pub fn enable_one(dir: &Path, r: &Restr, why: &str, by: &str) -> Unrestricted {
+    let user = user_of(r.uid);
+    let mark = |ok: bool, out: String| {
+        let a = Action { t: util::real_ms(), pkg: r.pkg.clone(), uid: r.uid, action: "enable".into(), ok, prev: Some("disabled".into()), out, by: by.into() };
+        journal(dir, &a);
+    };
+    if pkg_disabled(&r.pkg, &user) == Some(false) {
+        // включили без Жора (или пакет удалили) — отпускаем
+        mark(true, format!("{why}: уже включён — не трогаю"));
+        return Unrestricted::Skipped(Some("enabled".into()));
+    }
+    let out = util::run_cmd("pm", &["enable", "--user", &user, &r.pkg], 30_000).unwrap_or_default();
+    let ok = pkg_disabled(&r.pkg, &user) == Some(false);
+    mark(ok, format!("{why}: {}", out.trim()).chars().take(300).collect());
+    if ok { Unrestricted::Done } else { Unrestricted::Failed }
+}
+
+// ---- (0.8) отключить компонент (службу, провайдер и т. п.) внутри пакета ----
+
+/// «pkg/полный.класс» или «pkg/.класс».
+pub fn valid_comp(c: &str) -> bool {
+    match c.split_once('/') {
+        Some((p, cls)) => valid_pkg(p) && !cls.is_empty() && cls.len() < 256 && cls.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '$'),
+        None => false,
+    }
+}
+
+fn comp_class(c: &str) -> Option<(&str, String)> {
+    let (p, cls) = c.split_once('/')?;
+    Some((p, if cls.starts_with('.') { format!("{p}{cls}") } else { cls.to_string() }))
+}
+
+/// Отключённые компоненты пользователя из `dumpsys package <pkg>`: после строки «    User N: …» —
+/// блок «      disabledComponents:» с классами.
+fn parse_disabled_components(t: &str, user: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut cur: Option<String> = None;
+    let mut inside = false;
+    for line in t.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let l = line.trim();
+        if indent == 4 && l.starts_with("User ") {
+            cur = l[5..].split(':').next().map(str::to_string);
+            inside = false;
+            continue;
+        }
+        if l == "disabledComponents:" {
+            inside = true;
+            continue;
+        }
+        if inside {
+            if indent >= 8 && !l.is_empty() && !l.ends_with(':') {
+                if cur.as_deref() == Some(user) {
+                    out.insert(l.to_string());
+                }
+            } else {
+                inside = false;
+            }
+        }
+    }
+    out
+}
+
+fn comp_disabled(c: &str, user: &str) -> Option<bool> {
+    let (p, cls) = comp_class(c)?;
+    let t = util::run_cmd("dumpsys", &["package", p], 30_000)?;
+    Some(parse_disabled_components(&t, user).contains(&cls))
+}
+
+/// Отключить компонент у пользователя копии (uid). None — и так отключён (не наше).
+pub fn disable_comp_by(dir: &Path, comp: &str, uid: Option<u32>, by: &str, why: &str) -> Option<Action> {
+    if !valid_comp(comp) || comp.starts_with(crate::watch::APP_PKG) || comp.starts_with("android/") {
+        return None;
+    }
+    let user = user_of(uid);
+    if comp_disabled(comp, &user) == Some(true) {
+        return None;
+    }
+    let out = util::run_cmd("pm", &["disable", "--user", &user, comp], 30_000).unwrap_or_default();
+    let ok = comp_disabled(comp, &user) == Some(true);
+    let a = Action { t: util::real_ms(), pkg: comp.into(), uid, action: "cdisable".into(), ok, prev: Some("enabled".into()), out: format!("{why} {}", out.trim()).trim().chars().take(300).collect(), by: by.into() };
+    journal(dir, &a);
+    Some(a)
+}
+
+/// Включить обратно компонент, который отключил Жор.
+pub fn enable_comp_one(dir: &Path, r: &Restr, why: &str, by: &str) -> Unrestricted {
+    let user = user_of(r.uid);
+    let mark = |ok: bool, out: String| {
+        let a = Action { t: util::real_ms(), pkg: r.pkg.clone(), uid: r.uid, action: "cenable".into(), ok, prev: Some("disabled".into()), out, by: by.into() };
+        journal(dir, &a);
+    };
+    if comp_disabled(&r.pkg, &user) == Some(false) {
+        mark(true, format!("{why}: уже включён — не трогаю"));
+        return Unrestricted::Skipped(Some("enabled".into()));
+    }
+    let out = util::run_cmd("pm", &["enable", "--user", &user, &r.pkg], 30_000).unwrap_or_default();
+    let ok = comp_disabled(&r.pkg, &user) == Some(false);
+    mark(ok, format!("{why}: {}", out.trim()).chars().take(300).collect());
+    if ok { Unrestricted::Done } else { Unrestricted::Failed }
+}
+
+// ---- (0.8) без сети: своя цепочка iptables с правилами по uid ----
+//
+// `cmd connectivity set-package-networking-enabled` (FIREWALL_CHAIN_OEM_DENY_3) берёт uid пакета только основного
+// пользователя, а копиям во втором пространстве и двойных приложениях нужен свой uid. Поэтому — iptables/ip6tables:
+// цепочка zhor_out, переход в неё первым в OUTPUT, правило «uid → REJECT» на приложение. Исходящие пакеты приложения
+// (и ответы-подтверждения его соединений) не уходят — соединения рвутся, сервер перестаёт слать. После перезагрузки
+// правил нет — ядро ставит их заново, пока правило профиля действует.
+
+const NET_CHAIN: &str = "zhor_out";
+
+fn ipt(v6: bool, args: &[&str]) -> bool {
+    let mut a = vec!["-w", "5"];
+    a.extend_from_slice(args);
+    util::run_ok(if v6 { "ip6tables" } else { "iptables" }, &a, 10_000)
+}
+
+fn net_chain_ready() -> bool {
+    let mut ok = true;
+    for v6 in [false, true] {
+        if !ipt(v6, &["-L", NET_CHAIN, "-n"]) {
+            ipt(v6, &["-N", NET_CHAIN]);
+        }
+        if !ipt(v6, &["-C", "OUTPUT", "-j", NET_CHAIN]) {
+            ok &= ipt(v6, &["-I", "OUTPUT", "1", "-j", NET_CHAIN]);
+        }
+    }
+    ok
+}
+
+fn net_rule(uid: u32, add: bool) -> bool {
+    let u = uid.to_string();
+    let rule = ["-m", "owner", "--uid-owner", u.as_str(), "-j", "REJECT"];
+    let mut ok = true;
+    for v6 in [false, true] {
+        let with = |cmd: &'static str| {
+            let mut a: Vec<&str> = vec![cmd, NET_CHAIN];
+            a.extend_from_slice(&rule);
+            a
+        };
+        if add {
+            if !ipt(v6, &with("-C")) {
+                ok &= ipt(v6, &with("-A"));
+            }
+        } else {
+            for _ in 0..5 {
+                if !ipt(v6, &with("-D")) {
+                    break;
+                }
+            }
+            ok &= !ipt(v6, &with("-C"));
+        }
+    }
+    ok
+}
+
+/// Закрыть сеть приложению; `journal` — записать (первый раз; после перезагрузки правило ставится заново молча).
+pub fn nonet_by(dir: &Path, pkg: &str, uid: u32, by: &str, journal_it: bool) -> bool {
+    if crate::explain::uid_kind(uid) != "app" || pkg == crate::watch::APP_PKG {
+        return false;
+    }
+    let ok = net_chain_ready() && net_rule(uid, true);
+    if journal_it {
+        let a = Action { t: util::real_ms(), pkg: pkg.into(), uid: Some(uid), action: "nonet".into(), ok, prev: None, out: String::new(), by: by.into() };
+        journal(dir, &a);
+    }
+    ok
+}
+
+/// Открыть сеть обратно.
+pub fn net_one(dir: &Path, r: &Restr, why: &str, by: &str) -> Unrestricted {
+    let ok = r.uid.map(|u| net_rule(u, false)).unwrap_or(true);
+    let a = Action { t: util::real_ms(), pkg: r.pkg.clone(), uid: r.uid, action: "net".into(), ok, prev: None, out: why.chars().take(300).collect(), by: by.into() };
+    journal(dir, &a);
+    net_cleanup();
+    if ok { Unrestricted::Done } else { Unrestricted::Failed }
+}
+
+/// Пустую цепочку убрать совсем, чтобы от Жора в iptables ничего не оставалось.
+pub fn net_cleanup() {
+    for v6 in [false, true] {
+        let rules = util::run_cmd(if v6 { "ip6tables" } else { "iptables" }, &["-w", "5", "-S", NET_CHAIN], 10_000).unwrap_or_default();
+        if rules.lines().filter(|l| l.starts_with("-A")).count() == 0 {
+            while ipt(v6, &["-D", "OUTPUT", "-j", NET_CHAIN]) {}
+            ipt(v6, &["-X", NET_CHAIN]);
+        }
+    }
+}
+
+/// Итог возврата одного ограничения.
+pub enum Unrestricted {
+    Done,
+    Failed,
+    /// режим с тех пор поменяли (сами, в настройках, переустановкой) — уже не наше
+    Skipped(Option<String>),
+}
+
+/// Вернуть одно ограничение Жора в режим до него; пишется в журнал как «unrestrict».
+pub fn unrestrict_one(dir: &Path, r: &Restr, why: &str, by: &str) -> Unrestricted {
+    let user = user_of(r.uid);
+    // режим не прочитался — по журналу ограничение наше: снимаем
+    let now = bg_mode_sure(&r.pkg, &user);
+    if now.is_some() && now.as_deref() != Some("ignore") {
+        // режим поменяли без Жора: для режима отмечаем в журнале, что отпустили, — иначе он будет
+        // пытаться вернуть это снова и снова
+        if !by.is_empty() {
+            let a = Action {
+                t: util::real_ms(),
+                pkg: r.pkg.clone(),
+                uid: r.uid,
+                action: "unrestrict".into(),
+                ok: true,
+                prev: now.clone(),
+                out: format!("{why}: режим уже {} — не трогаю", now.as_deref().unwrap_or("?")),
+                by: by.into(),
+            };
+            journal(dir, &a);
+        }
+        return Unrestricted::Skipped(now);
+    }
+    let mode = match r.prev.as_str() {
+        m @ ("allow" | "foreground" | "default") => m,
+        _ => "allow",
+    };
+    let out = util::run_cmd("cmd", &["appops", "set", "--user", &user, &r.pkg, "RUN_ANY_IN_BACKGROUND", mode], 10_000).unwrap_or_default();
+    let after = bg_mode_sure(&r.pkg, &user);
+    let ok = after.as_deref() == Some(mode) || (mode == "allow" && after.is_some() && after.as_deref() != Some("ignore"));
+    let a = Action {
+        t: util::real_ms(),
+        pkg: r.pkg.clone(),
+        uid: r.uid,
+        action: "unrestrict".into(),
+        ok,
+        prev: Some("ignore".into()),
+        out: format!("{why}: {}", out.trim()).chars().take(300).collect(),
+        by: by.into(),
+    };
+    journal(dir, &a);
+    if ok { Unrestricted::Done } else { Unrestricted::Failed }
+}
+
+/// Вернуть всё, что ограничил Жор (вручную и режимами), в режим до него.
 pub fn revert_all(dir: &Path) -> Value {
     let mut done = Vec::new();
     let mut failed = Vec::new();
-    // не наше уже: режим поменяли с тех пор (сами, в настройках, переустановкой) — для журнала
     let mut skipped = Vec::new();
-    for r in claimed(&all_actions(dir)) {
-        let user = user_of(r.uid);
-        // режим не прочитался — по журналу ограничение наше: снимаем
-        let now = bg_mode_sure(&r.pkg, &user);
-        if now.is_some() && now.as_deref() != Some("ignore") {
-            skipped.push(json!({"pkg": r.pkg, "uid": r.uid, "mode": now}));
-            continue;
+    let all = all_actions(dir);
+    for r in claimed(&all) {
+        match unrestrict_one(dir, &r, "вернуть всё", "") {
+            Unrestricted::Done => done.push(r),
+            Unrestricted::Failed => failed.push(r),
+            Unrestricted::Skipped(mode) => skipped.push(json!({"pkg": r.pkg, "uid": r.uid, "mode": mode})),
         }
-        let mode = match r.prev.as_str() {
-            m @ ("allow" | "foreground" | "default") => m,
-            _ => "allow",
-        };
-        let out = util::run_cmd("cmd", &["appops", "set", "--user", &user, &r.pkg, "RUN_ANY_IN_BACKGROUND", mode], 10_000).unwrap_or_default();
-        let after = bg_mode_sure(&r.pkg, &user);
-        let ok = after.as_deref() == Some(mode) || (mode == "allow" && after.is_some() && after.as_deref() != Some("ignore"));
-        let a = Action { t: util::real_ms(), pkg: r.pkg.clone(), uid: r.uid, action: "unrestrict".into(), ok, prev: Some("ignore".into()), out: format!("вернуть всё: {}", out.trim()).chars().take(300).collect() };
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("actions.jsonl")) {
-            let _ = writeln!(f, "{}", serde_json::to_string(&a).unwrap_or_default());
-        }
-        if ok { done.push(r) } else { failed.push(r) }
     }
+    // (0.8) отключённые пакеты и закрытая сеть
+    for r in claimed_pair(&all, "disable", "enable", "disable") {
+        match enable_one(dir, &r, "вернуть всё", "revert") {
+            Unrestricted::Done => done.push(r),
+            Unrestricted::Failed => failed.push(r),
+            Unrestricted::Skipped(_) => skipped.push(json!({"pkg": r.pkg, "uid": r.uid, "mode": "enabled"})),
+        }
+    }
+    for r in claimed_pair(&all, "cdisable", "cenable", "component") {
+        match enable_comp_one(dir, &r, "вернуть всё", "revert") {
+            Unrestricted::Done => done.push(r),
+            Unrestricted::Failed => failed.push(r),
+            Unrestricted::Skipped(_) => skipped.push(json!({"pkg": r.pkg, "uid": r.uid, "mode": "enabled"})),
+        }
+    }
+    for r in claimed_pair(&all, "nonet", "net", "nonet") {
+        match net_one(dir, &r, "вернуть всё", "") {
+            Unrestricted::Done => done.push(r),
+            _ => failed.push(r),
+        }
+    }
+    net_cleanup();
     json!({"ok": failed.is_empty(), "reverted": done, "failed": failed, "skipped": skipped})
 }
 
@@ -400,8 +751,21 @@ mod tests {
         assert!(valid_pkg("com.example.app_2"));
     }
 
+    #[test]
+    fn disabled_components_per_user() {
+        let t = "Packages:\n  Package [com.example.sec] (abc):\n    User 0: ceDataInode=1 installed=true enabled=0\n      lastDisabledCaller: x\n      disabledComponents:\n        io.appmetrica.analytics.internal.AppMetricaService\n        com.example.sec.Other\n    User 10: ceDataInode=2 installed=true enabled=0\n      gids=[3003]\n";
+        let d0 = parse_disabled_components(t, "0");
+        assert!(d0.contains("io.appmetrica.analytics.internal.AppMetricaService") && d0.len() == 2);
+        assert!(parse_disabled_components(t, "10").is_empty());
+        assert!(valid_comp("com.miui.securitycenter/io.appmetrica.analytics.internal.AppMetricaService"));
+        assert!(valid_comp("com.example/.Inner$Svc"));
+        assert!(!valid_comp("com.example"));
+        assert!(!valid_comp("com.example/a b"));
+        assert_eq!(comp_class("com.example/.Svc").map(|x| x.1), Some("com.example.Svc".to_string()));
+    }
+
     fn act(t: i64, pkg: &str, action: &str, prev: Option<&str>, ok: bool) -> Action {
-        Action { t, pkg: pkg.into(), uid: Some(10_100), action: action.into(), ok, prev: prev.map(String::from), out: String::new() }
+        Action { t, pkg: pkg.into(), uid: Some(10_100), action: action.into(), ok, prev: prev.map(String::from), out: String::new(), by: String::new() }
     }
 
     #[test]

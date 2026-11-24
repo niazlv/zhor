@@ -103,8 +103,9 @@ private fun AppDetailContent(vm: Vm, navi: Navi, r: Report, a: App, seg: String?
         if (ins.isNotEmpty()) item(key = "ins") {
             Section("Выводы ядра") { ins.forEach { InsightCard(humanize(it, r, vm), null) } }
         }
-        // «Android OS»: за кого работает system и включённые спецвозможности — сразу под главным
+        // «Android OS»: из чего состоит, за кого работает system и включённые спецвозможности — сразу под главным
         val sw = r.systemWork
+        if (a.uid == 1000 && a.parts.isNotEmpty()) item(key = "parts") { OsPartsCard(a, sw) }
         if (a.uid == 1000 && sw != null) {
             item(key = "syswork") { SystemWorkCard(r, sw, vm, navi, seg) }
             if (sw.a11y.isNotEmpty()) item(key = "a11y") { A11yCard(sw, vm) }
@@ -124,6 +125,7 @@ private fun AppDetailContent(vm: Vm, navi: Navi, r: Report, a: App, seg: String?
         }
         item(key = "time") { AppTimelineSection(vm, navi, r, a) }
         item(key = "todo") { Advice(a, r) }
+        if (a.kind == "app" && a.packages.isNotEmpty()) item(key = "modes") { AppModesCard(vm, a) }
         if (a.kind == "app" && a.packages.isNotEmpty() && !vm.fileMode) item(key = "bg") { BackgroundCard(vm, navi, a) }
         if (a.processes.isNotEmpty()) {
             item(key = "ph") {
@@ -159,7 +161,7 @@ private fun AppDetailContent(vm: Vm, navi: Navi, r: Report, a: App, seg: String?
                 Section(title, sub = sub, help = help, icon = icons[i]) { ItemList(l, Pal.wakelock, showMs = help != "alarm", key = "al$help$seg") }
             }
         }
-        a.net?.let { n -> if (n.total > 0 || n.mobileWakeups + n.wifiWakeups > 0) item(key = "net") { NetCard(n) } }
+        if (a.net != null && (a.net.total > 0 || a.net.mobileWakeups + a.net.wifiWakeups > 0) || a.netIdle != null) item(key = "net") { NetCard(a.net, a.netIdle) }
         if (a.gpuMs > 0 || a.crashes + a.anrs > 0 || a.sysMah > 0) item(key = "misc") {
             Section("Прочее", icon = Icons.Outlined.BugReport) {
                 if (a.gpuMs > 0) KV("GPU занят", Fmt.dur(a.gpuMs), help = "gpu")
@@ -362,8 +364,10 @@ private fun ThreadRow(t: Thr, max: Double, explain: Boolean) {
 }
 
 @Composable
-private fun NetCard(n: Net) {
+private fun NetCard(n: Net?, idle: NetIdle?) {
     Section("Сеть", sub = "трафик и пробуждения от пакетов", help = "network", icon = Icons.Outlined.NetworkCheck) {
+        idle?.let { NetIdleRows(it) }
+        if (n == null) return@Section
         val parts = listOf(
             Pal.radio to (n.mobileRx + n.mobileTx).toDouble(),
             Pal.wifi to (n.wifiRx + n.wifiTx).toDouble(),

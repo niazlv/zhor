@@ -3,6 +3,7 @@
 pub mod binder;
 pub mod checkin;
 pub mod native;
+pub mod netstat;
 pub mod pb;
 pub mod usage;
 

@@ -47,6 +47,7 @@ fun SleepTab(vm: Vm, navi: Navi) {
             item(key = "cov") { CoverageNote(r) }
             item(key = "hero") { SleepHero(r) }
             item(key = "susp") { Suspends(r) }
+            r.netWakers?.let { nw -> if (nw.apps.isNotEmpty()) item(key = "netw") { NetWakersCard(vm, navi, r, nw) } }
             r.sys?.let { s ->
                 if (s.dozeMs + s.partialWlMs + s.radioMs > 0) item(key = "android") {
                     Section("Android при выключенном экране", sub = "за ${Fmt.span(s.from, s.to)}", icon = Icons.Outlined.PowerSettingsNew) {

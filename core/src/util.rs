@@ -167,9 +167,45 @@ pub fn fmt_dur(ms: u64) -> String {
     }
 }
 
+/// Объём: «850 Б», «12 КБ», «215 МБ», «1.4 ГБ».
+pub fn fmt_bytes(b: u64) -> String {
+    let f = b as f64;
+    if f >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} ГБ", f / (1024.0 * 1024.0 * 1024.0))
+    } else if f >= 1024.0 * 1024.0 {
+        format!("{:.0} МБ", f / (1024.0 * 1024.0))
+    } else if f >= 1024.0 {
+        format!("{:.0} КБ", f / 1024.0)
+    } else {
+        format!("{b} Б")
+    }
+}
+
 /// Запуск внешней команды с ограничением по времени; stdout как строка.
 pub fn run_cmd(prog: &str, args: &[&str], timeout_ms: u64) -> Option<String> {
     run_cmd_bytes(prog, args, timeout_ms).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Запустить команду и вернуть, успешно ли она завершилась (код 0). Вывод не нужен.
+pub fn run_ok(prog: &str, args: &[&str], timeout_ms: u64) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let Ok(mut child) = Command::new(prog).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
+        return false;
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if start.elapsed() > Duration::from_millis(timeout_ms) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return false,
+        }
+    }
 }
 
 /// То же, но сырые байты (для двоичного вывода, например `dumpsys batterystats --proto`).

@@ -104,6 +104,10 @@ class Vm(app: Application) : AndroidViewModel(app) {
     /** Что ограничил Жор и что до сих пор ограничено (null — ещё не загружено или ядро старое). */
     var restricted by mutableStateOf<List<Restr>?>(null)
 
+    /** (0.8) Режимы и метки. */
+    var modes by mutableStateOf<Res<ModesInfo>?>(null)
+    var modesSaving by mutableStateOf(false)
+
     /** Окно «нужны уведомления» в этом запуске уже было (закрыли «назад» — до следующего запуска). */
     var notifPromptShown by mutableStateOf(false)
 
@@ -140,6 +144,7 @@ class Vm(app: Application) : AndroidViewModel(app) {
                     fileMode = true
                     ready = true
                     error = null
+                    loadModes()
                 } catch (e: Exception) {
                     error = "$err\n\nФайл отчёта не прочитан: ${e.message}"
                 }
@@ -172,6 +177,7 @@ class Vm(app: Application) : AndroidViewModel(app) {
                 updatedAt = System.currentTimeMillis()
                 error = null
                 loadAlerts()
+                loadModes()
             } catch (e: Exception) {
                 error = e.message ?: e.toString()
             } finally {
@@ -427,12 +433,22 @@ class Vm(app: Application) : AndroidViewModel(app) {
     private val icons = ConcurrentHashMap<String, ImageBitmap>()
     private val noIcon = ConcurrentHashMap.newKeySet<String>()
 
+    /**
+     * Сведения о пакете, даже если он стоит только во втором пространстве или отключён: без этих флагов
+     * PackageManager основного пользователя его не видит — ни имени, ни иконки.
+     */
+    private fun appInfo(pkg: String): android.content.pm.ApplicationInfo? = try {
+        pm.getApplicationInfo(
+            pkg,
+            android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES or android.content.pm.PackageManager.MATCH_DISABLED_COMPONENTS or
+                android.content.pm.PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS,
+        )
+    } catch (_: Exception) {
+        null
+    }
+
     private fun pkgLabel(pkg: String): String = labels.getOrPut(pkg) {
-        try {
-            pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
-        } catch (_: Exception) {
-            pkg
-        }
+        appInfo(pkg)?.let { pm.getApplicationLabel(it).toString() } ?: pkg
     }
 
     fun labelOf(a: App): String {
@@ -481,7 +497,7 @@ class Vm(app: Application) : AndroidViewModel(app) {
         if (noIcon.contains(pkg)) return null
         icons[pkg]?.let { return it }
         return try {
-            val d: Drawable = pm.getApplicationIcon(pkg)
+            val d: Drawable = appInfo(pkg)?.let { pm.getApplicationIcon(it) } ?: pm.getApplicationIcon(pkg)
             val b = d.toBitmap(96, 96).asImageBitmap()
             icons[pkg] = b
             b
@@ -491,19 +507,36 @@ class Vm(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Пакет копии приложения. Про uid другого пространства (1010123 — второе пространство) Android основному
+     * пользователю не отвечает — SecurityException без INTERACT_ACROSS_USERS, приложение падало. Поэтому: у пакета
+     * один номер приложения во всех пространствах — спрашиваем про его uid в основном (uid % 100000), а если там
+     * его нет — берём из списков ядра (группы, профили, все приложения).
+     */
+    private fun pkgOfUid(uid: Int): String? {
+        if (uid % 100000 < 10000) return null
+        (modes?.value()?.packages?.get(uid) ?: installed?.get(uid))?.firstOrNull()?.let { return it }
+        return try {
+            pm.getPackagesForUid(uid % 100000)?.firstOrNull()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /** Метка для uid из ленты или «живого» ряда. */
     fun labelOfUid(uid: Int, fallback: String, seg: String? = null): String {
         (reportFor(seg) ?: report)?.app(uid)?.let { return labelOf(it) }
         report?.app(uid)?.let { return labelOf(it) }
-        if (uid % 100000 >= 10000) {
-            pm.getPackagesForUid(uid)?.firstOrNull()?.let { return pkgLabel(it) }
+        pkgOfUid(uid)?.let { p ->
+            val user = uid / 100000
+            return pkgLabel(p) + if (user > 0) " (польз. $user)" else ""
         }
         return fallback
     }
 
     fun iconOfUid(uid: Int, seg: String? = null): ImageBitmap? {
         (reportFor(seg) ?: report)?.app(uid)?.let { return iconOf(it) }
-        if (uid % 100000 >= 10000) pm.getPackagesForUid(uid)?.firstOrNull()?.let { return iconOfPkg(it) }
+        pkgOfUid(uid)?.let { return iconOfPkg(it) }
         if (uid % 100000 == 1000) return iconOfPkg("android")
         return null
     }
@@ -689,6 +722,56 @@ class Vm(app: Application) : AndroidViewModel(app) {
             loadRestricted()
         }
     }
+
+    /** Все приложения телефона (uid → пакеты) — для выбора в группу; грузится по требованию. */
+    var installed by mutableStateOf<Map<Int, List<String>>?>(null)
+
+    fun loadModes(withInstalled: Boolean = false, withBt: Boolean = false) {
+        if (fileMode) {
+            // демо без root: состояние из modes.json рядом с report.json (ответ команды modes)
+            modes = File(files, "modes.json").takeIf { it.exists() }
+                ?.let { f -> runCatching { Res.Ok(ModesInfo.parse(JSONObject(f.readText()))) }.getOrNull() }
+                ?: Res.Err("Профили работают в ядре — нужен root.")
+            (modes as? Res.Ok)?.v?.installed?.let { installed = it }
+            return
+        }
+        if (!ready) return
+        if (modes !is Res.Ok) modes = Res.Loading
+        viewModelScope.launch {
+            modes = try {
+                val m = withContext(Dispatchers.IO) { core.modes(withInstalled, withBt) }
+                m.installed?.let { installed = it }
+                Res.Ok(m)
+            } catch (e: Unsupported) {
+                Res.Err("Профили появятся с ядром 0.8. Сейчас на телефоне более старое ядро — перезапустите приложение, оно обновит ядро.", unsupported = true)
+            } catch (e: Exception) {
+                Res.Err(e.message ?: e.toString())
+            }
+        }
+    }
+
+    private fun modesCall(ok: String?, f: () -> ModesInfo) {
+        if (fileMode) {
+            toast = "Это отчёт из файла — профили меняет ядро, нужен root"
+            return
+        }
+        if (modesSaving) return
+        modesSaving = true
+        viewModelScope.launch {
+            try {
+                modes = Res.Ok(withContext(Dispatchers.IO) { f() })
+                if (ok != null) toast = ok
+            } catch (e: Exception) {
+                toast = "Не вышло: ${e.message}"
+            } finally {
+                modesSaving = false
+            }
+        }
+    }
+
+    fun setModes(c: ModesCfg, ok: String? = null) = modesCall(ok) { core.modesSet(c) }
+    fun setAppGroup(uid: Int, group: String, on: Boolean) = modesCall(null) { core.appGroup(uid, group, on) }
+    fun setAppRule(profile: String, uid: Int, level: String?) = modesCall(null) { core.appRule(profile, uid, level) }
 
     fun loadRestricted() {
         if (fileMode || !ready) return

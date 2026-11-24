@@ -2,12 +2,12 @@
 
 use crate::procfs::{ProcScanner, TickCpu};
 use crate::profile::PowerProfile;
-use crate::store::{Bucket, OpenBucket, ProcRec, Store, ThrRec, WsRec};
+use crate::store::{Bucket, NetRec, OpenBucket, ProcRec, Store, ThrRec, WsRec};
 use crate::sys::{self, SysSnap};
 use crate::sysfs::{self, Battery, BatteryReader, Screen, ScreenReader, SuspendReader, WakeupSources};
 use crate::util;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -89,6 +89,32 @@ pub struct Daemon {
     pub hist: std::sync::Arc<std::sync::Mutex<crate::history::HistStore>>,
     /// (0.6) сторож: тревоги по свежим корзинам
     pub watch: crate::watch::Watch,
+    /// (0.8) последний замер сети по uid и когда он был (настенное время)
+    net_last: Option<BTreeMap<u32, sys::netstat::Cnt>>,
+    net_at: i64,
+    /// (0.8) пакеты с VPN-службой: их трафик в долях «кто будит по сети» не считается
+    pub vpn_pkgs: BTreeSet<String>,
+    /// (0.8) режимы и метки приложений, их состояние и защищённые пакеты
+    pub modes: crate::modes::Modes,
+    pub mode_rt: crate::modes::Runtime,
+    pub protect: crate::modes::Protect,
+}
+
+/// Как часто снимать сеть по приложениям (плюс каждая смена экрана и зарядки).
+const NET_EVERY_MS: i64 = 5 * 60_000;
+
+fn merge_net(dst: &mut Vec<NetRec>, src: Vec<NetRec>) {
+    for r in src {
+        match dst.iter_mut().find(|x| x.u == r.u) {
+            Some(x) => {
+                x.rp += r.rp;
+                x.rb += r.rb;
+                x.tp += r.tp;
+                x.tb += r.tb;
+            }
+            None => dst.push(r),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -103,6 +129,8 @@ pub struct StepCost {
     pub procs_us: u64,
     pub wakeup_sources_us: u64,
     pub hosts_us: u64,
+    /// последний замер сети по приложениям (раз в 5 мин), мкс
+    pub net_us: u64,
     pub procs: u32,
     pub threads: u32,
     pub tis_reads: u32,
@@ -157,6 +185,12 @@ impl Daemon {
             cpu_total_us: 0,
             hist,
             watch,
+            net_last: None,
+            net_at: 0,
+            vpn_pkgs: BTreeSet::new(),
+            modes: crate::modes::Modes::load(&dir),
+            mode_rt: crate::modes::Runtime::default(),
+            protect: crate::modes::Protect::default(),
         };
         d.load_events();
         d.load_snaps();
@@ -238,6 +272,12 @@ impl Daemon {
         if !p.is_empty() {
             self.pkgs = p;
         }
+        let users: BTreeSet<u32> = self.pkgs.keys().map(|u| u / 100_000).collect();
+        let vpn = sys::netstat::vpn_packages(&users);
+        if !vpn.is_empty() {
+            self.vpn_pkgs = vpn;
+        }
+        self.protect = crate::modes::Protect::load(&users, &self.vpn_pkgs);
         self.pkgs_at = util::real_ms();
     }
 
@@ -329,6 +369,28 @@ impl Daemon {
             self.want_snap = true;
         }
 
+        // (0.8) сеть по приложениям: раз в 5 мин и на смене экрана/зарядки — тогда разность целиком
+        // относится к состоянию до смены и ложится в корзину этого состояния (её закроют ниже)
+        let changed = screen.on != last_screen.on || batt.plugged != last_batt.plugged;
+        let mut net_pending: Vec<NetRec> = Vec::new();
+        if changed || now.real - self.net_at >= NET_EVERY_MS {
+            let t_net = std::time::Instant::now();
+            self.net_at = now.real;
+            if let Some(cur) = sys::netstat::take() {
+                if let Some(prev) = &self.net_last {
+                    net_pending = sys::netstat::delta(prev, &cur)
+                        .into_iter()
+                        .map(|(u, c)| NetRec { u, rp: c.rp, rb: c.rb, tp: c.tp, tb: c.tb })
+                        .collect();
+                }
+                self.net_last = Some(cur);
+            }
+            self.cost.net_us = t_net.elapsed().as_micros() as u64;
+        }
+        if let Some(ob) = self.open.as_mut() {
+            merge_net(&mut ob.b.net, std::mem::take(&mut net_pending));
+        }
+
         let d_boot = now.boot.saturating_sub(last.boot);
         let d_mono = now.mono.saturating_sub(last.mono).min(d_boot);
         let d_susp = d_boot - d_mono;
@@ -356,6 +418,7 @@ impl Daemon {
             o.b.freq = cpu.freq_ticks.iter().map(|v| vec![0; v.len()]).collect();
             o
         });
+        merge_net(&mut ob.b.net, net_pending);
         let b = &mut ob.b;
         b.t1 = now.real;
         b.span += d_boot;
@@ -545,6 +608,53 @@ impl Daemon {
         }
         self.want_snap = true;
         (n, freed)
+    }
+
+    /// (0.8) Режимы: решить, что сделать. Сами команды (`cmd appops`, `force-stop`) — вне замка,
+    /// в [crate::modes::execute]. `env` — экономия энергии и страна сети (их читает цикл, тоже вне замка).
+    pub fn modes_plan(&mut self, env: &crate::modes::Env) -> Vec<crate::modes::Op> {
+        let now = util::real_ms();
+        let Some((_, batt, screen)) = self.last.clone() else { return Vec::new() };
+        if !crate::modes::due(&self.mode_rt, now, screen.on) {
+            return Vec::new();
+        }
+        let claims: Vec<crate::compare::Restr> = crate::compare::claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();
+        let dis_claims: Vec<crate::compare::Restr> = crate::compare::disable_claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();
+        let net_claims: Vec<crate::compare::Restr> = crate::compare::nonet_claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();
+        let comp_claims: Vec<crate::compare::Restr> = crate::compare::comp_claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();
+        let running: BTreeSet<u32> = self.scanner.pid_names().values().map(|(u, _)| *u).collect();
+        let open = self.open_snapshot();
+        let cut = now - 35 * 60_000;
+        let tail: Vec<&Bucket> = self.store.mem.iter().filter(|b| b.t1 > cut).chain(open.iter()).collect();
+        // когда приложение было на экране — по истории Android (в памяти ядра ~26 ч)
+        let top: Option<(HashMap<u32, (i64, bool)>, i64)> = self.hist.lock().ok().and_then(|h| {
+            let since = h.ev.first().map(|e| e.t0)?;
+            let mut m: HashMap<u32, (i64, bool)> = HashMap::new();
+            for e in h.ev.iter().filter(|e| e.k == crate::history::Kind::Top) {
+                let x = m.entry(e.u).or_insert((0, false));
+                x.0 = x.0.max(e.t1);
+                x.1 |= e.open;
+            }
+            Some((m, since))
+        });
+        let inputs = crate::modes::Inputs {
+            now,
+            local_min: crate::modes::local_min(now),
+            screen_on: screen.on,
+            plugged: batt.plugged,
+            level: batt.level,
+            env,
+            pkgs: &self.pkgs,
+            protect: &self.protect,
+            running: &running,
+            claims: &claims,
+            dis_claims: &dis_claims,
+            net_claims: &net_claims,
+            comp_claims: &comp_claims,
+            tail: &tail,
+            last_top: top.as_ref().map(|(m, s)| (m, *s)),
+        };
+        crate::modes::plan(&self.modes, &mut self.mode_rt, &inputs)
     }
 
     /// Сторож: проверить правила по хвосту корзин (не чаще раза в 5 мин, только на шаге сбора).

@@ -19,6 +19,7 @@ pub const SOCK: &str = "zhord";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static SNAP_RUNNING: AtomicBool = AtomicBool::new(false);
+static MODES_RUNNING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
@@ -169,6 +170,81 @@ fn spawn_deliver(d: Arc<Mutex<Daemon>>, dir: PathBuf, alerts: Vec<crate::watch::
     });
 }
 
+/// (0.8) Выполнить решения режимов вне замка; тревоги авто-уборки — сторожу.
+fn spawn_modes(d: Arc<Mutex<Daemon>>, dir: PathBuf, ops: Vec<crate::modes::Op>, mute: Vec<String>) {
+    std::thread::spawn(move || {
+        let (lines, alerts) = crate::modes::execute(&dir, ops, &mute);
+        for l in lines {
+            log(&dir, &l);
+        }
+        for mut a in alerts {
+            let (ok, _) = crate::watch::deliver(&a);
+            a.sent = ok;
+            if let Ok(mut g) = d.lock() {
+                g.watch.record(a);
+            }
+        }
+        MODES_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Пересмотреть режимы сразу (после смены меток и настроек), не дожидаясь шага сбора.
+fn modes_now(d: Arc<Mutex<Daemon>>, dir: PathBuf) {
+    std::thread::spawn(move || {
+        if MODES_RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let want_bt = d.lock().map(|g| g.modes.profiles.iter().any(|p| p.on && !p.when.bt_away.is_empty())).unwrap_or(false);
+        let env = crate::modes::Env::read(want_bt);
+        let (ops, mute) = match d.lock() {
+            Ok(mut g) => (g.modes_plan(&env), g.config.watch_mute.clone()),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+        if ops.is_empty() {
+            MODES_RUNNING.store(false, Ordering::SeqCst);
+        } else {
+            spawn_modes(d, dir, ops, mute);
+        }
+    });
+}
+
+/// Состояние групп и профилей для приложения. `installed` — ещё все приложения телефона (uid → пакеты) для выбора.
+fn modes_json(g: &Daemon, dir: &std::path::Path, installed: bool) -> Value {
+    let claims: Vec<crate::compare::Restr> = crate::compare::claims(dir).into_iter().filter(|r| r.by == "mode").collect();
+    let log: Vec<crate::compare::Action> =
+        crate::compare::actions(dir, None, g.config.keep_days).into_iter().filter(|a| a.by == "mode" || a.by == "watch").take(80).collect();
+    // пакеты участников групп и приложений с правилами — чтобы показать и те, что не попали в отчёт
+    let mut uids: std::collections::BTreeSet<u32> = g.modes.groups.iter().flat_map(|x| x.members.iter().copied()).collect();
+    for p in &g.modes.profiles {
+        uids.extend(p.apps.keys().filter_map(|k| k.parse::<u32>().ok()));
+    }
+    uids.extend(g.mode_rt.effective.keys().copied());
+    let pkgs_of = |u: &u32| (u.to_string(), json!(g.pkgs.get(u).cloned().unwrap_or_default()));
+    let known: serde_json::Map<String, Value> = uids.iter().map(pkgs_of).collect();
+    let disabled: Vec<crate::compare::Restr> = crate::compare::disable_claims(dir).into_iter().filter(|r| r.by == "mode").collect();
+    let nonet: Vec<crate::compare::Restr> = crate::compare::nonet_claims(dir).into_iter().filter(|r| r.by == "mode").collect();
+    let comps: Vec<crate::compare::Restr> = crate::compare::comp_claims(dir).into_iter().filter(|r| r.by == "mode").collect();
+    // пакеты групп по имени: в каких пространствах они есть (uid → пакеты)
+    let comp_pkgs: Vec<String> =
+        g.modes.groups.iter().flat_map(|x| x.components.iter()).filter_map(|c| c.split_once('/').map(|x| x.0.to_string())).collect();
+    let named: std::collections::BTreeSet<&String> = g.modes.groups.iter().flat_map(|x| x.packages.iter()).chain(comp_pkgs.iter()).collect();
+    let present: serde_json::Map<String, Value> = named
+        .iter()
+        .map(|p| (p.to_string(), json!(g.pkgs.iter().filter(|(_, ps)| ps.contains(p)).map(|(u, _)| *u).collect::<Vec<u32>>())))
+        .collect();
+    let mut o = json!({
+        "modes": g.modes, "state": g.mode_rt, "effective": g.mode_rt.effective_list(),
+        "protected": g.protect.pkgs, "claims": claims, "disabled": disabled, "nonet": nonet, "components": comps,
+        "log": log, "packages": known, "present": present,
+    });
+    if installed {
+        let all: serde_json::Map<String, Value> =
+            g.pkgs.iter().filter(|(u, _)| crate::explain::uid_kind(**u) == "app").map(|(u, p)| (u.to_string(), json!(p))).collect();
+        o["installed"] = Value::Object(all);
+    }
+    o
+}
+
 fn spawn_snapshot(d: Arc<Mutex<Daemon>>, dir: PathBuf) {
     if SNAP_RUNNING.swap(true, Ordering::SeqCst) {
         return;
@@ -224,11 +300,24 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
     let mut guard = crate::guard::Guard::new(&dir);
     // раз в сутки напомнить приложению проверить новую версию
     let mut upd = crate::update::Ping::new(&dir);
+    // экономия энергии Android и страна сети: `settings`/`getprop` — отдельные процессы, раз в минуту вне замка
+    let (mut env, mut env_at, mut bt_at) = (crate::modes::Env::default(), 0i64, 0i64);
 
     // цикл сбора
     loop {
         if STOP.load(Ordering::SeqCst) {
             break;
+        }
+        if util::real_ms() - env_at >= 60_000 {
+            // Bluetooth — каждую минуту, только если условие «нет устройства» кому-то нужно; иначе раз в 30 мин,
+            // чтобы в приложении был свежий список устройств
+            let want_bt = d.lock().map(|g| g.modes.profiles.iter().any(|p| p.on && !p.when.bt_away.is_empty())).unwrap_or(false);
+            let bt = want_bt || util::real_ms() - bt_at >= 30 * 60_000;
+            env = crate::modes::Env::read(bt);
+            env_at = util::real_ms();
+            if bt {
+                bt_at = env_at;
+            }
         }
         let iv = {
             let mut g = d.lock().unwrap();
@@ -240,6 +329,16 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
                 Ok(alerts) if !alerts.is_empty() => spawn_deliver(d.clone(), dir.clone(), alerts),
                 Ok(_) => {}
                 Err(_) => log(&dir, "паника в стороже — пропуск"),
+            }
+            if !MODES_RUNNING.load(Ordering::SeqCst) {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.modes_plan(&env))) {
+                    Ok(ops) if !ops.is_empty() => {
+                        MODES_RUNNING.store(true, Ordering::SeqCst);
+                        spawn_modes(d.clone(), dir.clone(), ops, g.config.watch_mute.clone());
+                    }
+                    Ok(_) => {}
+                    Err(_) => log(&dir, "паника в профилях — пропуск"),
+                }
             }
             if g.snap_due(util::real_ms()) && !SNAP_RUNNING.load(Ordering::SeqCst) {
                 g.want_snap = false;
@@ -477,6 +576,68 @@ fn handle(conn: UnixStream, d: Arc<Mutex<Daemon>>, dir: PathBuf) {
                 r.to_string()
             }
             "restricted" => json!({"restricted": crate::compare::restricted(&dir)}).to_string(),
+            "modes" => {
+                let raw = raw_req(&line);
+                // bt — прочитать Bluetooth сейчас (экран профиля: выбор устройства)
+                let bt = if raw["bt"].as_bool().unwrap_or(false) { crate::modes::read_bt() } else { None };
+                let mut g = d.lock().unwrap();
+                if let Some(bt) = bt {
+                    g.mode_rt.set_bt(&bt);
+                }
+                modes_json(&g, &dir, raw["installed"].as_bool().unwrap_or(false)).to_string()
+            }
+            "modes_set" => {
+                let raw = raw_req(&line);
+                match serde_json::from_value::<crate::modes::Modes>(raw["modes"].clone()) {
+                    Err(e) => json!({"error": format!("режимы не разобрались: {e}")}).to_string(),
+                    Ok(m) => {
+                        let mut g = d.lock().unwrap();
+                        let m = m.clamped();
+                        m.save(&dir);
+                        g.modes = m;
+                        g.mode_rt.poke();
+                        modes_now(d.clone(), dir.clone());
+                        log(&dir, &format!("профили изменены: групп {}, профилей {}", g.modes.groups.len(), g.modes.profiles.len()));
+                        modes_json(&g, &dir, false).to_string()
+                    }
+                }
+            }
+            "app_group" | "app_rule" => {
+                let raw = raw_req(&line);
+                let uid = raw["uid"].as_u64().map(|u| u as u32);
+                let mut g = d.lock().unwrap();
+                match uid {
+                    None => json!({"error": "нужен uid"}).to_string(),
+                    Some(u) if crate::explain::uid_kind(u) != "app" => json!({"error": "группы и правила — только для приложений"}).to_string(),
+                    Some(u) => {
+                        let protected = g.pkgs.get(&u).map(|ps| ps.iter().any(|p| g.protect.has(p))).unwrap_or(false);
+                        let (ok, what) = if req.cmd == "app_group" {
+                            let grp = raw["group"].as_str().unwrap_or("");
+                            let on = raw["on"].as_bool().unwrap_or(true);
+                            (g.modes.set_member(u, grp, on), format!("группа «{grp}» {u}: {}", if on { "добавил" } else { "убрал" }))
+                        } else {
+                            let prof = raw["profile"].as_str().unwrap_or("");
+                            let level = raw["level"].as_str().filter(|s| !s.is_empty());
+                            if protected && level.is_some_and(|l| l != "none") {
+                                (false, String::new())
+                            } else {
+                                (g.modes.set_app_rule(prof, u, level), format!("правило {u} в «{prof}»: {}", level.unwrap_or("как у группы")))
+                            }
+                        };
+                        if !ok {
+                            json!({"error": if protected { "это приложение нужно для работы телефона — Жор его не ограничивает" } else { "нет такой группы или профиля" }}).to_string()
+                        } else {
+                            let m = g.modes.clone().clamped();
+                            m.save(&dir);
+                            g.modes = m;
+                            g.mode_rt.poke();
+                            modes_now(d.clone(), dir.clone());
+                            log(&dir, &what);
+                            modes_json(&g, &dir, false).to_string()
+                        }
+                    }
+                }
+            }
             "revert_all" => {
                 let r = crate::compare::revert_all(&dir);
                 log(&dir, &format!("вернуть всё: {} возвращено, {} не вышло", r["reverted"].as_array().map(|a| a.len()).unwrap_or(0), r["failed"].as_array().map(|a| a.len()).unwrap_or(0)));

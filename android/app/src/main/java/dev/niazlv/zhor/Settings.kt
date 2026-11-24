@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.BatterySaver
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
@@ -89,6 +90,7 @@ fun SettingsScreen(vm: Vm, navi: Navi) {
             item(key = "cfg") { ConfigCard(vm) }
             item(key = "nav") {
                 Section("Ещё") {
+                    NavRow(Icons.Outlined.BatterySaver, "Профили и группы", "экономия, за границей, ночью — что ограничивать") { navi.modes() }
                     NavRow(Icons.Outlined.NotificationsActive, "Сторож и «до/после»", "уведомление в момент проблемы, сравнение покоя") { navi.watch() }
                     NavRow(Icons.Outlined.Storage, "Данные и выгрузка", "место на диске, экспорт отчёта, очистка") { navi.data() }
                     NavRow(Icons.AutoMirrored.Outlined.MenuBook, "Как читать", "термины, нормы, что делать") { navi.guide() }
@@ -213,7 +215,7 @@ private fun ConfigCard(vm: Vm) {
 fun Choice(title: String, explain: String, opts: List<Opt>, cur: Long, enabled: Boolean, onPick: (Long) -> Unit) {
     Column(Modifier.padding(vertical = 6.dp)) {
         Text(title, style = MaterialTheme.typography.bodyLarge)
-        Text(explain, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (explain.isNotEmpty()) Text(explain, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
             opts.forEachIndexed { i, o ->

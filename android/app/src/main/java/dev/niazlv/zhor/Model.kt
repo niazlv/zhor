@@ -14,6 +14,10 @@ private fun JSONObject.intOrNull(k: String): Int? = if (!has(k) || isNull(k)) nu
 private inline fun <T> JSONArray?.list(f: (JSONObject) -> T): List<T> =
     if (this == null) emptyList() else (0 until length()).mapNotNull { optJSONObject(it)?.let(f) }
 
+/** Массив массивов: [[имя, число], …]. */
+private inline fun <T> JSONArray?.list2(f: (JSONArray) -> T): List<T> =
+    if (this == null) emptyList() else (0 until length()).mapNotNull { optJSONArray(it)?.let(f) }
+
 private fun JSONArray?.strings(): List<String> =
     if (this == null) emptyList() else (0 until length()).mapNotNull { optString(it, null) }
 
@@ -47,6 +51,47 @@ data class Net(
     val total get() = mobileRx + mobileTx + wifiRx + wifiTx
 }
 
+/** (0.8) Сеть приложения в покое (экран выключен, без зарядки) — по замерам ядра. */
+data class NetIdle(
+    val rxPackets: Long, val rxBytes: Long, val txPackets: Long, val txBytes: Long,
+    /** принято пакетов в час покоя */
+    val rxPerHour: Double,
+    /** доля среди всех принятых в покое пакетов, 0..1 (у VPN-клиента 0) */
+    val share: Double,
+    /** VPN-клиент: его пакеты — зашифрованный трафик других приложений */
+    val vpn: Boolean,
+) {
+    companion object {
+        fun parse(o: JSONObject) = NetIdle(
+            o.lng("rx_packets"), o.lng("rx_bytes"), o.lng("tx_packets"), o.lng("tx_bytes"),
+            o.dbl("rx_per_hour"), o.dbl("share"), o.optBoolean("vpn", false),
+        )
+    }
+}
+
+data class NetWaker(val uid: Int, val label: String, val packages: List<String>, val kind: String, val n: NetIdle)
+
+/** (0.8) Кто будит по сети в покое. */
+data class NetWakers(
+    val idleMs: Long, val since: Long, val wifiWakeups: Long, val mobileWakeups: Long, val rxPackets: Long,
+    val apps: List<NetWaker>,
+) {
+    val wakeupsPerHour get() = if (idleMs > 0) (wifiWakeups + mobileWakeups) * 3_600_000.0 / idleMs else 0.0
+
+    companion object {
+        fun parse(o: JSONObject) = NetWakers(
+            o.lng("idle_ms"), o.lng("since"), o.lng("wifi_wakeups"), o.lng("mobile_wakeups"), o.lng("rx_packets"),
+            o.optJSONArray("apps").list { a -> NetWaker(a.optInt("uid"), a.str("label"), a.optJSONArray("packages").strings(), a.str("kind"), NetIdle.parse(a)) },
+        )
+    }
+}
+
+/** (0.8) Часть расхода «Android OS»: процессы по смыслу. */
+data class OsPart(
+    val key: String, val title: String, val explain: String, val mah: Double, val mahScreenOff: Double, val share: Double,
+    val top: List<Pair<String, Double>>,
+)
+
 data class App(
     val uid: Int, val label: String, val packages: List<String>, val kind: String,
     val mah: Double, val cpuMs: Long, val cpuMah: Double, val cpuMahScreenOff: Double,
@@ -57,6 +102,10 @@ data class App(
     val crashes: Long, val anrs: Long, val why: List<String>,
     /** (0.4) Сколько system_server потратил по запросам этого приложения: CPU, ≈мА·ч, топ-вызовы. Уже входит в «Android OS». */
     val systemMs: Double = 0.0, val systemMah: Double = 0.0, val systemCalls: List<SysCall> = emptyList(),
+    /** (0.8) Сеть в покое; null — ядро старше или замеров в окне нет. */
+    val netIdle: NetIdle? = null,
+    /** (0.8) Только «Android OS»: из чего состоит расход. */
+    val parts: List<OsPart> = emptyList(),
 ) {
     /** CPU по ядру, если есть, иначе по модели Android. */
     val cpuBest get() = if (cpuMah > 0) cpuMah else components["cpu"] ?: 0.0
@@ -154,6 +203,8 @@ data class Report(
     val history: History? = null,
     /** (0.4) За кого работает system_server; null — ядро старше или снимков с разбором ещё нет. */
     val systemWork: SystemWork? = null,
+    /** (0.8) Кто будит по сети в покое; null — ядро старше или замеров сети в окне нет. */
+    val netWakers: NetWakers? = null,
 ) {
     val fullMah get() = device["battery_full_mah"]?.toDoubleOrNull() ?: 0.0
     val designMah get() = device["battery_design_mah"]?.toDoubleOrNull() ?: 0.0
@@ -201,6 +252,13 @@ data class Report(
                     },
                     a.lng("gpu_ms"), a.lng("crashes"), a.lng("anrs"), a.optJSONArray("why").strings(),
                     a.dbl("system_ms"), a.dbl("system_mah"), a.optJSONArray("system_calls").list(::sysCall),
+                    a.optJSONObject("net_idle")?.let { NetIdle.parse(it) },
+                    a.optJSONArray("parts").list { p ->
+                        OsPart(
+                            p.str("key"), p.str("title"), p.str("explain"), p.dbl("mah"), p.dbl("mah_screen_off"), p.dbl("share"),
+                            p.optJSONArray("top").list2 { x -> x.optString(0) to x.optDouble(1, 0.0) },
+                        )
+                    },
                 )
             }
             val k = o.optJSONObject("kernel") ?: JSONObject()
@@ -248,6 +306,7 @@ data class Report(
                 kernel, clusters, tl, sys, o.optJSONArray("notes").strings(), events, dev, ins,
                 o.optJSONObject("history")?.let { History.parse(it) },
                 o.optJSONObject("system_work")?.let { SystemWork.parse(it) },
+                o.optJSONObject("net_wakers")?.let { NetWakers.parse(it) },
             )
         }
     }
@@ -396,6 +455,8 @@ data class SystemWork(
     val from: Long, val to: Long, val exact: Boolean, val note: String?,
     val binderMs: Double, val queueMs: Double, val ownMs: Double, val masPerCpuMs: Double, val mahTotal: Double,
     val callers: List<SysCaller>, val queues: List<SysQueue>, val a11y: List<String>,
+    /** (0.8) весь system_server за окно отчёта, мА·ч (0 — ядро старше) */
+    val serverMah: Double = 0.0,
 ) {
     val totalMs get() = binderMs + queueMs
     /** ≈мА·ч работы «за саму систему» (очереди без заказчика). */
@@ -419,6 +480,7 @@ data class SystemWork(
                 )
             },
             o.optJSONArray("a11y").strings(),
+            o.dbl("server_mah"),
         )
     }
 }
@@ -455,16 +517,178 @@ data class AppState(val pkg: String, val bg: String?, val restricted: Boolean, v
     }
 }
 
-data class ActionRec(val t: Long, val pkg: String, val uid: Int?, val action: String, val ok: Boolean, val prev: String?) {
+data class ActionRec(
+    val t: Long, val pkg: String, val uid: Int?, val action: String, val ok: Boolean, val prev: String?,
+    /** (0.8) "" — вручную, mode — экономный режим, clean — авто-уборка */
+    val by: String = "", val out: String = "",
+) {
     companion object {
-        fun parse(o: JSONObject) = ActionRec(o.lng("t"), o.str("pkg"), o.intOrNull("uid"), o.str("action"), o.optBoolean("ok"), o.strOrNull("prev"))
+        fun parse(o: JSONObject) = ActionRec(
+            o.lng("t"), o.str("pkg"), o.intOrNull("uid"), o.str("action"), o.optBoolean("ok"), o.strOrNull("prev"),
+            o.str("by"), o.str("out"),
+        )
     }
 }
 
 /** Ограничение фона, которое поставил Жор и которое до сих пор действует; [prev] — режим до Жора. */
-data class Restr(val pkg: String, val uid: Int?, val since: Long, val prev: String) {
+data class Restr(val pkg: String, val uid: Int?, val since: Long, val prev: String, val by: String = "") {
     companion object {
-        fun parse(o: JSONObject) = Restr(o.str("pkg"), o.intOrNull("uid"), o.lng("since"), o.str("prev"))
+        fun parse(o: JSONObject) = Restr(o.str("pkg"), o.intOrNull("uid"), o.lng("since"), o.str("prev"), o.str("by"))
+    }
+}
+
+// ---- (0.8) группы и профили ----
+
+/** Группа: копии приложений по uid и пакеты по имени (во всех пространствах, в том числе системные). */
+data class MGroup(
+    val id: String, val name: String, val members: List<Int>, val packages: List<String> = emptyList(),
+    /** компоненты «пакет/класс» — отключаются отдельно, пакет целиком не трогается */
+    val components: List<String> = emptyList(),
+) {
+    val size get() = members.size + packages.size + components.size
+}
+
+data class MWhen(
+    val manual: Boolean = false, val always: Boolean = false, val saver: Boolean = false, val belowPct: Int = 0,
+    val abroad: Boolean = false, val night: Boolean = false, val nightFrom: Int = 23 * 60, val nightTo: Int = 7 * 60,
+    /** когда ни одно из этих Bluetooth-устройств не подключено (дольше 10 мин) */
+    val btAway: List<String> = emptyList(),
+) {
+    fun json(): JSONObject = JSONObject().put("manual", manual).put("always", always).put("saver", saver).put("below_pct", belowPct)
+        .put("abroad", abroad).put("night", night).put("night_from", nightFrom).put("night_to", nightTo).put("bt_away", JSONArray(btAway))
+
+    companion object {
+        fun parse(o: JSONObject) = MWhen(
+            o.optBoolean("manual"), o.optBoolean("always"), o.optBoolean("saver"), o.optInt("below_pct"),
+            o.optBoolean("abroad"), o.optBoolean("night"), o.optInt("night_from", 23 * 60), o.optInt("night_to", 7 * 60),
+            o.optJSONArray("bt_away").strings(),
+        )
+    }
+}
+
+/** Профиль: когда включается и что делать с группами. rules: id группы или "rest" → none | watch | bg | hard. */
+data class MProfile(
+    val id: String, val name: String, val on: Boolean, val `when`: MWhen,
+    val rules: Map<String, String>, val apps: Map<Int, String>,
+    val heavyMa: Double, val heavyRxH: Int, val idleH: Int,
+) {
+    fun json(): JSONObject = JSONObject().put("id", id).put("name", name).put("on", on).put("when", `when`.json())
+        .put("rules", JSONObject().apply { rules.forEach { (k, v) -> put(k, v) } })
+        .put("apps", JSONObject().apply { apps.forEach { (k, v) -> put(k.toString(), v) } })
+        .put("heavy_ma", heavyMa).put("heavy_rx_h", heavyRxH).put("idle_h", idleH)
+
+    companion object {
+        fun parse(o: JSONObject): MProfile {
+            val r = o.optJSONObject("rules")
+            val a = o.optJSONObject("apps")
+            return MProfile(
+                o.str("id"), o.str("name"), o.optBoolean("on", true), MWhen.parse(o.optJSONObject("when") ?: JSONObject()),
+                r?.keys()?.asSequence()?.associateWith { r.optString(it) } ?: emptyMap(),
+                a?.keys()?.asSequence()?.mapNotNull { k -> k.toIntOrNull()?.let { it to a.optString(k) } }?.toMap() ?: emptyMap(),
+                o.optDouble("heavy_ma", 5.0), o.optInt("heavy_rx_h", 2000), o.optInt("idle_h", 3),
+            )
+        }
+    }
+}
+
+/** Настройки групп и профилей (modes.json ядра). */
+data class ModesCfg(val groups: List<MGroup>, val profiles: List<MProfile>, val homeCountry: String, val presets: List<String> = emptyList()) {
+    fun groupsOf(uid: Int, pkgs: List<String> = emptyList()) = groups.filter { uid in it.members || pkgs.any { p -> p in it.packages } }
+    fun group(id: String) = groups.firstOrNull { it.id == id }
+    fun profile(id: String) = profiles.firstOrNull { it.id == id }
+
+    fun withMember(uid: Int, gid: String, on: Boolean) = copy(
+        groups = groups.map { g -> if (g.id != gid) g else g.copy(members = (g.members - uid) + if (on) listOf(uid) else emptyList()) },
+    )
+    fun withGroup(g: MGroup) = copy(groups = if (groups.any { it.id == g.id }) groups.map { if (it.id == g.id) g else it } else groups + g)
+    fun withoutPackage(gid: String, pkg: String) = copy(groups = groups.map { g -> if (g.id != gid) g else g.copy(packages = g.packages - pkg, components = g.components - pkg) })
+    fun withoutGroup(id: String) = copy(groups = groups.filter { it.id != id }, profiles = profiles.map { it.copy(rules = it.rules - id) })
+    fun withProfile(p: MProfile) = copy(profiles = if (profiles.any { it.id == p.id }) profiles.map { if (it.id == p.id) p else it } else profiles + p)
+    fun withoutProfile(id: String) = copy(profiles = profiles.filter { it.id != id })
+
+    fun json(): JSONObject = JSONObject()
+        .put("groups", JSONArray().apply {
+            groups.forEach { g ->
+                put(JSONObject().put("id", g.id).put("name", g.name).put("members", JSONArray(g.members)).put("packages", JSONArray(g.packages)).put("components", JSONArray(g.components)))
+            }
+        })
+        .put("presets", JSONArray(presets))
+        .put("profiles", JSONArray().apply { profiles.forEach { put(it.json()) } })
+        .put("home_country", homeCountry)
+
+    companion object {
+        fun parse(o: JSONObject) = ModesCfg(
+            o.optJSONArray("groups").list { g ->
+                val m = g.optJSONArray("members")
+                MGroup(
+                    g.str("id"), g.str("name"), if (m == null) emptyList() else (0 until m.length()).map { m.optInt(it) },
+                    g.optJSONArray("packages").strings(), g.optJSONArray("components").strings(),
+                )
+            },
+            o.optJSONArray("profiles").list { MProfile.parse(it) },
+            o.str("home_country"),
+            o.optJSONArray("presets").strings(),
+        )
+    }
+}
+
+data class ActiveP(val id: String, val name: String, val why: List<String>, val since: Long)
+data class BtDev(val name: String, val connected: Boolean)
+data class ModesState(
+    val active: List<ActiveP>, val saver: Boolean, val country: String, val home: String, val abroad: Boolean,
+    /** сопряжённые Bluetooth-устройства по последнему чтению ядра */
+    val bt: List<BtDev> = emptyList(),
+)
+
+/** Правило, которое сейчас действует на приложение: самое строгое из активных профилей. pkg — системный пакет с общим uid. */
+data class Eff(val uid: Int, val level: String, val profile: String, val tripped: Boolean, val pkg: String? = null)
+
+/** Ответ ядра на modes / modes_set / app_group / app_rule. */
+data class ModesInfo(
+    val cfg: ModesCfg, val state: ModesState, val effective: List<Eff>, val protected: Set<String>,
+    /** что сейчас ограничено профилями: фон, отключённые пакеты, закрытая сеть */
+    val claims: List<Restr>,
+    val disabled: List<Restr>,
+    val nonet: List<Restr>,
+    val components: List<Restr>,
+    /** что делали профили, новые первыми */
+    val log: List<ActionRec>,
+    /** пакеты участников групп и приложений с правилами */
+    val packages: Map<Int, List<String>>,
+    /** все приложения телефона — только если просили (installed) */
+    val installed: Map<Int, List<String>>?,
+    /** пакеты групп по имени → uid, где они установлены */
+    val present: Map<String, List<Int>> = emptyMap(),
+) {
+    fun isProtected(pkgs: List<String>) = pkgs.any { it in protected || it.startsWith("com.android.providers.") }
+    fun eff(uid: Int) = effective.firstOrNull { it.uid == uid }
+    fun pkgsOf(uid: Int) = packages[uid] ?: installed?.get(uid).orEmpty()
+
+    companion object {
+        private fun pmap(o: JSONObject?): Map<Int, List<String>> =
+            o?.keys()?.asSequence()?.mapNotNull { k -> k.toIntOrNull()?.let { it to o.optJSONArray(k).strings() } }?.toMap() ?: emptyMap()
+
+        fun parse(o: JSONObject): ModesInfo {
+            val st = o.optJSONObject("state") ?: JSONObject()
+            return ModesInfo(
+                ModesCfg.parse(o.optJSONObject("modes") ?: JSONObject()),
+                ModesState(
+                    st.optJSONArray("active").list { a -> ActiveP(a.str("id"), a.str("name"), a.optJSONArray("why").strings(), a.lng("since")) },
+                    st.optBoolean("saver"), st.str("country"), st.str("home"), st.optBoolean("abroad"),
+                    st.optJSONArray("bt").list { b -> BtDev(b.str("name"), b.optBoolean("connected")) },
+                ),
+                o.optJSONArray("effective").list { e -> Eff(e.optInt("uid"), e.str("level"), e.str("profile"), e.optBoolean("tripped"), e.strOrNull("pkg")) },
+                o.optJSONArray("protected").strings().toSet(),
+                o.optJSONArray("claims").list { Restr.parse(it) },
+                o.optJSONArray("disabled").list { Restr.parse(it) },
+                o.optJSONArray("nonet").list { Restr.parse(it) },
+                o.optJSONArray("components").list { Restr.parse(it) },
+                o.optJSONArray("log").list { ActionRec.parse(it) },
+                pmap(o.optJSONObject("packages")),
+                o.optJSONObject("installed")?.let { pmap(it) },
+                o.optJSONObject("present")?.let { p -> p.keys().asSequence().associateWith { k -> p.optJSONArray(k)?.let { a -> (0 until a.length()).map { a.optInt(it) } } ?: emptyList() } } ?: emptyMap(),
+            )
+        }
     }
 }
 

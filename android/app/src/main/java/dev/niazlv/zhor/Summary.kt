@@ -54,6 +54,7 @@ fun SummaryTab(vm: Vm, navi: Navi, goTab: (Int) -> Unit) {
             }
             item(key = "upd") { UpdateBanner(vm) { navi.settings() } }
             item(key = "watch") { WatchSummary(vm, navi) }
+            item(key = "modes") { ModesBanner(vm, navi) }
             reportOverview(r, vm, navi, seg = null, goTab = goTab)
         }
     }

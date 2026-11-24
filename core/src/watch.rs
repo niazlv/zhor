@@ -206,8 +206,11 @@ impl OffStats {
     }
 
     fn top_waker(&self) -> Option<(String, f64)> {
+        // таймер AlarmManager «смена часов» (CLOCK_REALTIME + CANCEL_ON_SET) ядро отмечает на каждом выходе из сна
+        // (timerfd_resume): его счётчик — эхо чужих пробуждений, не причина. Остальные [timerfd] будят по-настоящему.
         self.ws
             .iter()
+            .filter(|(n, _)| !(n.starts_with("[timerfd]") && n.contains("смена часов")))
             .map(|(n, w)| (n, w.wakeups))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(n, c)| (n.clone(), c))

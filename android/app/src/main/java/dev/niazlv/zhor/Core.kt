@@ -179,6 +179,19 @@ class Core(ctx: Context) {
         return o.optBoolean("ok") to o.optJSONObject("state")?.let { AppState.parse(it) }
     }
 
+    /** (0.8) Группы и профили; installed — ещё все приложения телефона. */
+    fun modes(installed: Boolean = false, bt: Boolean = false): ModesInfo =
+        ModesInfo.parse(query(JSONObject().put("cmd", "modes").put("installed", installed).put("bt", bt)))
+
+    fun modesSet(c: ModesCfg): ModesInfo = ModesInfo.parse(query(JSONObject().put("cmd", "modes_set").put("modes", c.json())))
+
+    fun appGroup(uid: Int, group: String, on: Boolean): ModesInfo =
+        ModesInfo.parse(query(JSONObject().put("cmd", "app_group").put("uid", uid).put("group", group).put("on", on)))
+
+    /** Правило приложения в профиле; level = null — как у его групп. */
+    fun appRule(profile: String, uid: Int, level: String?): ModesInfo =
+        ModesInfo.parse(query(JSONObject().put("cmd", "app_rule").put("uid", uid).put("profile", profile).put("level", level ?: "")))
+
     /** Что ограничил Жор и что до сих пор ограничено. */
     fun restricted(): List<Restr> {
         val arr = query(JSONObject().put("cmd", "restricted")).optJSONArray("restricted") ?: return emptyList()

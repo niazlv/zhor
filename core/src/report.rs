@@ -4,7 +4,7 @@ use crate::explain;
 use crate::sampler::{Daemon, Event};
 use crate::store::{Bucket, WsRec};
 use crate::sys::{self, SysSnap};
-use crate::util::{self, fmt_dur, mas_to_mah};
+use crate::util::{self, fmt_bytes, fmt_dur, mas_to_mah};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -98,6 +98,68 @@ pub struct AppRep {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub system_calls: Vec<SysCallRep>,
     pub why: Vec<String>,
+    /// (0.8) сеть в покое (экран выкл, без зарядки) по замерам ядра
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_idle: Option<NetIdleRep>,
+    /// (0.8) только «Android OS» (uid 1000): из чего состоит её расход
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<PartRep>,
+}
+
+/// (0.8) Сеть приложения в покое: принятые и отправленные пакеты за время с выключенным экраном
+/// без зарядки (замеры `dumpsys netstats`, см. sys/netstat.rs).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct NetIdleRep {
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    /// принято пакетов в час покоя
+    pub rx_per_hour: f64,
+    /// доля среди всех принятых в покое пакетов (VPN-клиенты не считаются), 0..1
+    pub share: f64,
+    /// VPN-клиент: его пакеты — зашифрованный трафик других приложений
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub vpn: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct NetWakerRep {
+    pub uid: u32,
+    pub label: String,
+    pub packages: Vec<String>,
+    pub kind: &'static str,
+    #[serde(flatten)]
+    pub n: NetIdleRep,
+}
+
+/// (0.8) Кто будит по сети: пробуждения от входящих пакетов в покое и приложения, получившие пакеты.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct NetWakersRep {
+    /// покой с замерами сети, мс
+    pub idle_ms: u64,
+    /// с какого момента в окне есть замеры сети
+    pub since: i64,
+    /// пробуждения ядра от входящих пакетов в покое (по источникам пробуждения)
+    pub wifi_wakeups: u64,
+    pub mobile_wakeups: u64,
+    /// всего принято в покое пакетов (без VPN-клиентов)
+    pub rx_packets: u64,
+    pub apps: Vec<NetWakerRep>,
+}
+
+/// (0.8) Часть расхода «Android OS» (uid 1000 — это десятки процессов, а не одна программа).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PartRep {
+    pub key: &'static str,
+    pub title: &'static str,
+    pub explain: &'static str,
+    pub mah: f64,
+    pub mah_screen_off: f64,
+    /// доля от расхода «Android OS», 0..1
+    pub share: f64,
+    /// крупнейшие процессы или потоки части: имя, мА·ч
+    pub top: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -163,6 +225,12 @@ pub struct SysWorkRep {
     pub mah_total: f64,
     pub callers: Vec<SysCallerRep>,
     pub queues: Vec<SysQueueRep>,
+    /// (0.8) весь system_server за окно отчёта по записям ядра: мА·ч и CPU, мс — чтобы было видно,
+    /// какую часть его работы Android раскладывает по заказчикам
+    #[serde(default)]
+    pub server_mah: f64,
+    #[serde(default)]
+    pub server_cpu_ms: f64,
     /// включённые службы спецвозможностей: из-за них все приложения шлют события в system_server
     pub a11y: Vec<String>,
 }
@@ -314,6 +382,9 @@ pub struct Report {
     /// история событий Android за окно (см. history.rs); при `uid` — только это приложение
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::history::HistRep>,
+    /// (0.8) кто будит по сети в покое
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_wakers: Option<NetWakersRep>,
 }
 
 /// Начало и конец интервала по пресету.
@@ -545,6 +616,11 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
     let mut level_drop_on = 0f64;
     let mut level_drop_off = 0f64;
     let mut timeline_src: Vec<(Bucket, f64)> = Vec::new();
+    // (0.8) сеть в покое: uid → (принято пакетов, байт, отправлено пакетов, байт)
+    let mut net_idle: HashMap<u32, [f64; 4]> = HashMap::new();
+    let mut idle_spans: Vec<(i64, f64)> = Vec::new();
+    let mut net_since = i64::MAX;
+    let (mut net_wifi_wk, mut net_mob_wk) = (0f64, 0f64);
     for b in &buckets {
         let len = (b.t1 - b.t0).max(1) as f64;
         let ov = ((b.t1.min(to) - b.t0.max(from)) as f64 / len).clamp(0.0, 1.0);
@@ -622,6 +698,30 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
         for (r, c) in &b.rr {
             *rr.entry(r.clone()).or_default() += *c as f64 * ov;
         }
+        if !b.scr && !b.plug {
+            idle_spans.push((b.t0, span));
+            if !b.net.is_empty() {
+                net_since = net_since.min(b.t0);
+            }
+            for r in &b.net {
+                let x = net_idle.entry(r.u).or_default();
+                x[0] += r.rp as f64 * ov;
+                x[1] += r.rb as f64 * ov;
+                x[2] += r.tp as f64 * ov;
+                x[3] += r.tb as f64 * ov;
+            }
+            // один пакет будит несколько источников сразу (WoW + RX, IPA + rmnet) — берём наибольший
+            let (mut wf, mut mb) = (0u64, 0u64);
+            for w in &b.ws {
+                match net_ws_kind(&w.n) {
+                    Some(true) => wf = wf.max(w.wk),
+                    Some(false) => mb = mb.max(w.wk),
+                    None => {}
+                }
+            }
+            net_wifi_wk += wf as f64 * ov;
+            net_mob_wk += mb as f64 * ov;
+        }
         for (ci, v) in b.freq.iter().enumerate().take(nclusters) {
             for (i, x) in v.iter().enumerate() {
                 if let Some(dst) = freq[ci].get_mut(i) {
@@ -698,6 +798,11 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
         .fold((0.0, 0.0), |acc, (_, a)| (acc.0 + a.e, acc.1 + a.t));
     let k = if ss_t > 1000.0 { ss_e / ss_t } else { d.pp.mid_ma(0) / 1000.0 };
     rep.system_work = system_work(&snaps, from, to, k, pkgs);
+    if let Some(w) = rep.system_work.as_mut() {
+        w.server_mah = mas_to_mah(ss_e);
+        w.server_cpu_ms = ss_t;
+    }
+    let net_wakers = net_wakers(&net_idle, &idle_spans, net_since, net_wifi_wk, net_mob_wk, pkgs, &d.vpn_pkgs);
     let sys_by_uid: HashMap<u32, (f64, f64, Vec<SysCallRep>)> = rep
         .system_work
         .as_ref()
@@ -771,24 +876,22 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
             }
         }
         app.why = why(app, &rep.totals);
-        if app.uid % 100_000 == 1000 {
-            if let Some(w) = &rep.system_work {
-                let top: Vec<String> = w
-                    .callers
-                    .iter()
-                    .filter(|c| c.uid % 100_000 != 1000)
-                    .take(4)
-                    .map(|c| format!("{} {:.0}%", c.label, 100.0 * c.share))
-                    .collect();
-                if !top.is_empty() {
-                    app.why.insert(
-                        0,
-                        format!(
-                            "system_server в основном работает по заказу других: {}. Подробно — «За кого работает system».",
-                            top.join(", ")
-                        ),
+        if let Some(nw) = &net_wakers {
+            app.net_idle = nw.apps.iter().find(|x| x.uid == app.uid).map(|x| x.n.clone());
+        }
+        if app.uid == 1000 {
+            app.parts = os_parts(app);
+            if !app.parts.is_empty() {
+                let top: Vec<String> = app.parts.iter().take(3).map(|p| format!("{} — {:.0}%", p.title.to_lowercase(), 100.0 * p.share)).collect();
+                let n = app.processes.len();
+                let mut text = format!("«Android OS» — это {n} системных процессов, а не одна программа: {}.", top.join(", "));
+                if let Some(w) = rep.system_work.as_ref().filter(|w| w.mah_total > 0.0) {
+                    text += &format!(
+                        " По заказчикам Android раскладывает только запросы к system_server — {:.1} мА·ч, они в «За кого работает system».",
+                        w.mah_total
                     );
                 }
+                app.why.insert(0, text);
             }
         }
     }
@@ -800,6 +903,7 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
         apps.truncate(n);
     }
     rep.apps = apps;
+    rep.net_wakers = net_wakers;
 
     // ---- ядро и сон ----
     let mut wsv: Vec<WsItem> = ws
@@ -851,6 +955,162 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
         rep.notes.push("За этот интервал записей демона нет (демон не работал). Системные данные — из снимков batterystats.".into());
     }
     rep
+}
+
+/// Источник пробуждения от входящих пакетов: Some(true) — Wi-Fi, Some(false) — мобильная сеть.
+fn net_ws_kind(name: &str) -> Option<bool> {
+    let l = name.to_ascii_lowercase();
+    if l == "qcom_rx_wakelock" || l.starts_with("wlan_rx") || l.contains("wlan_wake") || l == "wlan_rx_wake" {
+        Some(true)
+    } else if l == "ipa_ws" || l.starts_with("rmnet_ipa") || l == "rmnet_ctl" || l.starts_with("ipa_client_apps_wan") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// (0.8) «Кто будит по сети» из замеров в покое. None — замеров сети в окне нет.
+fn net_wakers(
+    net: &HashMap<u32, [f64; 4]>,
+    idle_spans: &[(i64, f64)],
+    since: i64,
+    wifi_wk: f64,
+    mob_wk: f64,
+    pkgs: &BTreeMap<u32, Vec<String>>,
+    vpn_pkgs: &std::collections::BTreeSet<String>,
+) -> Option<NetWakersRep> {
+    if since == i64::MAX {
+        return None;
+    }
+    // покой — только с первого замера (раньше ядро сеть не снимало): с запасом на интервал замера
+    let idle_ms: f64 = idle_spans.iter().filter(|(t0, _)| *t0 >= since - 5 * 60_000).map(|(_, s)| *s).sum();
+    if idle_ms < 60_000.0 {
+        return None;
+    }
+    let hours = idle_ms / 3_600_000.0;
+    let is_vpn = |uid: u32| pkgs.get(&uid).map(|ps| ps.iter().any(|p| vpn_pkgs.contains(p))).unwrap_or(false);
+    let total: f64 = net.iter().filter(|(u, _)| !is_vpn(**u)).map(|(_, c)| c[0]).sum();
+    let mut apps: Vec<NetWakerRep> = net
+        .iter()
+        .filter(|(_, c)| c[0] >= 1.0)
+        .map(|(&uid, c)| {
+            let vpn = is_vpn(uid);
+            let (label, packages) = label_for(uid, pkgs);
+            NetWakerRep {
+                uid,
+                label,
+                packages,
+                kind: explain::uid_kind(uid),
+                n: NetIdleRep {
+                    rx_packets: c[0].round() as u64,
+                    rx_bytes: c[1].round() as u64,
+                    tx_packets: c[2].round() as u64,
+                    tx_bytes: c[3].round() as u64,
+                    rx_per_hour: c[0] / hours,
+                    share: if vpn || total <= 0.0 { 0.0 } else { c[0] / total },
+                    vpn,
+                },
+            }
+        })
+        .collect();
+    apps.sort_by(|a, b| b.n.rx_packets.cmp(&a.n.rx_packets));
+    apps.truncate(25);
+    Some(NetWakersRep {
+        idle_ms: idle_ms as u64,
+        since,
+        wifi_wakeups: wifi_wk.round() as u64,
+        mobile_wakeups: mob_wk.round() as u64,
+        rx_packets: total.round() as u64,
+        apps,
+    })
+}
+
+const OS_PARTS: &[(&str, &str, &str)] = &[
+    ("screen", "Картинка на экране", "Сборка кадров (SurfaceFlinger) и вывод на дисплей. Тратится, пока экран горит, — по сути это часть цены самого экрана."),
+    ("suspend", "Засыпание и пробуждения", "Служба, которая укладывает процессор спать. Чем чаще телефон будят, тем больше она работает: это цена частых пробуждений, а не её собственная прожорливость."),
+    ("server_binder", "Системные службы: запросы", "Потоки binder в system_server — ответы на запросы приложений и других системных процессов. Кто сколько заказал — в блоке «За кого работает system»."),
+    ("server_own", "Системные службы: своя работа", "Остальные потоки system_server: сборка мусора, управление памятью, питанием, сетью, датчиками, уведомлениями. Заказчика у этой работы нет."),
+    ("systemui", "Шторка, строка состояния, экран блокировки", "SystemUI рисует всё системное поверх приложений. Частые обновления уведомлений (счётчики скорости, загрузки) заставляют её перерисовываться."),
+    ("sensors", "Датчики и касания", "Службы датчиков и сенсорного экрана."),
+    ("security", "Ключи и безопасность", "Хранилище ключей, защищённые элементы, проверки безопасности."),
+    ("vendor", "Службы производителя", "Процессы Xiaomi и Qualcomm: управление питанием, связь между устройствами, дисплей и прочее."),
+    ("other", "Остальные системные процессы", "Прочие процессы под системным uid."),
+    ("noncpu", "Не процессор (модель Android)", "Что Android насчитал системе сверх процессора: радио, Wi-Fi, GPS, датчики — по своей модели расхода."),
+];
+
+/// Часть «Android OS» по имени процесса.
+fn os_part(name: &str) -> &'static str {
+    let l = name.to_ascii_lowercase();
+    let has = |p: &[&str]| p.iter().any(|x| l.contains(x));
+    if l.starts_with("surfaceflinger") || has(&["composer", "graphics.allocator", "displayfeature", "renderengine", "hardware.display"]) {
+        "screen"
+    } else if l.starts_with("android.system.suspend") {
+        "suspend"
+    } else if l.starts_with("com.android.systemui") {
+        "systemui"
+    } else if has(&["sensor", "touch"]) {
+        "sensors"
+    } else if has(&["keymint", "keystore", "secure_element", "gatekeeper", "securitycenter", "weaver", "authsecret"]) {
+        "security"
+    } else if l.starts_with("com.miui") || l.starts_with("com.xiaomi") || l.starts_with("com.qualcomm") || l.starts_with("com.qti") || has(&["xiaomi", "vendor.qti", "miui"]) {
+        "vendor"
+    } else {
+        "other"
+    }
+}
+
+/// (0.8) Из чего состоит расход «Android OS»: процессы по смыслу, system_server — на запросы и своё.
+fn os_parts(app: &AppRep) -> Vec<PartRep> {
+    let mut m: BTreeMap<&'static str, PartRep> = BTreeMap::new();
+    // name: None — остаток без имени, в «в основном» не попадает
+    let mut add = |key: &'static str, mah: f64, off: f64, name: Option<String>| {
+        if mah <= 0.0 {
+            return;
+        }
+        let (_, title, explain) = OS_PARTS.iter().find(|p| p.0 == key).copied().unwrap_or(("other", "", ""));
+        let p = m.entry(key).or_insert_with(|| PartRep { key, title, explain, ..Default::default() });
+        p.mah += mah;
+        p.mah_screen_off += off;
+        if let Some(n) = name {
+            p.top.push((n, mah));
+        }
+    };
+    for p in &app.processes {
+        if p.name == "system_server" {
+            let is_binder = |n: &str| n.starts_with("binder:") || n.starts_with("HwBinder:");
+            let binder: f64 = p.threads.iter().filter(|t| is_binder(&t.name)).map(|t| t.mah).sum();
+            let own = (p.mah - binder).max(0.0);
+            let k = if p.mah > 0.0 { p.mah_screen_off / p.mah } else { 0.0 };
+            add("server_binder", binder, binder * k, Some("потоки binder".into()));
+            let mut th: Vec<&ThrRep> = p.threads.iter().filter(|t| !is_binder(&t.name) && !t.name.starts_with('<')).collect();
+            th.sort_by(|a, b| b.mah.partial_cmp(&a.mah).unwrap_or(std::cmp::Ordering::Equal));
+            let named: f64 = th.iter().take(3).map(|t| t.mah).sum();
+            for t in th.iter().take(3) {
+                add("server_own", t.mah, t.mah * k, Some(t.name.clone()));
+            }
+            add("server_own", (own - named).max(0.0), (own - named).max(0.0) * k, None);
+        } else {
+            add(os_part(&p.name), p.mah, p.mah_screen_off, Some(p.name.clone()));
+        }
+    }
+    let noncpu = app.mah - app.cpu_mah;
+    if app.cpu_mah > 0.0 && noncpu > 0.01 {
+        add("noncpu", noncpu, 0.0, None);
+    }
+    let total: f64 = m.values().map(|p| p.mah).sum();
+    let mut parts: Vec<PartRep> = m
+        .into_values()
+        .map(|mut p| {
+            p.share = if total > 0.0 { p.mah / total } else { 0.0 };
+            p.top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            p.top.retain(|x| x.1 >= 0.005);
+            p.top.truncate(3);
+            p
+        })
+        .filter(|p| p.mah >= 0.01)
+        .collect();
+    parts.sort_by(|a, b| b.mah.partial_cmp(&a.mah).unwrap_or(std::cmp::Ordering::Equal));
+    parts
 }
 
 fn fill_sys(app: &mut AppRep, delta: Option<&SysSnap>) {
@@ -1235,6 +1495,8 @@ fn system_work(snaps: &[&SysSnap], from: i64, to: i64, mas_per_ms: f64, pkgs: &B
         callers,
         queues,
         a11y: b.work.a11y.clone(),
+        server_mah: 0.0,
+        server_cpu_ms: 0.0,
     })
 }
 
@@ -1281,6 +1543,31 @@ fn insights(r: &Report) -> Vec<Insight> {
             ("bad", "Телефон почти не спит")
         };
         out.push(ins(level, "sleep", title.into(), text, None));
+    }
+    // (0.8) кто будит по сети
+    if let Some(nw) = &r.net_wakers {
+        if let Some(a) = nw.apps.iter().filter(|a| !a.n.vpn).max_by_key(|a| a.n.rx_packets) {
+            if nw.idle_ms >= 30 * 60_000 && a.n.share >= 0.3 && a.n.rx_per_hour >= 300.0 {
+                let wk = (nw.wifi_wakeups + nw.mobile_wakeups) as f64 / hours(nw.idle_ms);
+                let mut text = format!(
+                    "Пока экран был выключен, «{}» приняло {:.0}% всех входящих пакетов — {:.0} в час, {}. ",
+                    a.label,
+                    100.0 * a.n.share,
+                    a.n.rx_per_hour,
+                    fmt_bytes(a.n.rx_bytes)
+                );
+                if wk >= 60.0 {
+                    text += &format!("Сеть будила процессор ~{wk:.0} раз в час. ");
+                }
+                text += if a.kind == "app" {
+                    "Во сне каждый входящий пакет будит процессор. Проверьте фоновые загрузки и синхронизацию приложения или ограничьте ему фон."
+                } else {
+                    "Во сне каждый входящий пакет будит процессор. Это не обычное приложение, а системный процесс или программа, запущенная от root: посмотрите, что она качает в это время."
+                };
+                let level = if a.n.rx_per_hour >= 2000.0 { "bad" } else { "warn" };
+                out.push(ins(level, "sleep", format!("В покое сеть будит «{}»", a.label), text, Some(a.uid)));
+            }
+        }
     }
     // разряд при выключенном экране
     if t.screen_off_ms >= 30 * 60_000 && t.pct_per_hour_screen_off > 0.0 {

@@ -40,6 +40,20 @@ pub struct WsRec {
     pub pv: u64,
 }
 
+/// (0.8) Сеть приложения за отрезок между замерами `dumpsys netstats`: принято/отправлено пакетов
+/// и байт. Замер — раз в 5 мин и на смене экрана/зарядки, разность лежит в корзине, где замер снят
+/// (а относится к её состоянию: экран, зарядка).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetRec {
+    pub u: u32,
+    pub rp: u64,
+    pub rb: u64,
+    #[serde(default)]
+    pub tp: u64,
+    #[serde(default)]
+    pub tb: u64,
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -83,6 +97,9 @@ pub struct Bucket {
     /// GPU занят, доля 0..1 (по kgsl), среднее
     pub gpu: f64,
     pub ticks: u32,
+    /// (0.8) сеть по приложениям (см. NetRec); пусто — замера в этой корзине не было
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub net: Vec<NetRec>,
 }
 
 pub const MAX_THREADS_PER_PROC: usize = 20;
