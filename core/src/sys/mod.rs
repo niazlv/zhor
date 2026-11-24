@@ -5,6 +5,7 @@ pub mod checkin;
 pub mod native;
 pub mod netstat;
 pub mod pb;
+pub mod prop;
 pub mod usage;
 
 use crate::util;

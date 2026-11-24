@@ -1,6 +1,6 @@
 [package]
 name = "zhord"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "Жор: root-профилировщик энергопотребления Android (ядро-демон и CLI)"
 license = "MIT"

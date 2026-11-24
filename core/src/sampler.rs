@@ -619,6 +619,9 @@ impl Daemon {
             return Vec::new();
         }
         let claims: Vec<crate::compare::Restr> = crate::compare::claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();
+        if !self.mode_rt.trips_restored() {
+            self.mode_rt.restore_trips(&crate::compare::watch_trips(&self.dir), &claims);
+        }
         let dis_claims: Vec<crate::compare::Restr> = crate::compare::disable_claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();
         let net_claims: Vec<crate::compare::Restr> = crate::compare::nonet_claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();
         let comp_claims: Vec<crate::compare::Restr> = crate::compare::comp_claims(&self.dir).into_iter().filter(|r| r.by == "mode").collect();

@@ -85,6 +85,24 @@ pub struct Screen {
 pub struct ScreenReader {
     dpms: Option<String>,
     backlight: Option<(String, f64)>,
+    /// (0.8.1) Состояние дисплея по мнению Android — см. `read`.
+    state: Option<crate::sys::prop::Prop>,
+    state_tried_ms: u64,
+}
+
+/// Свойство, куда Android пишет состояние основного дисплея (Display.STATE_*): 1 — выключен,
+/// 2 — включён, 3/4 — Always-On Display (doze / doze_suspend), 5 — VR, 6 — включён, но без обновления.
+const SCREEN_STATE_PROP: &str = "debug.tracing.screen_state";
+/// Свойства нет — ищем снова не чаще раза в минуту (только в «своём» файле, это дёшево).
+const STATE_RETRY_MS: u64 = 60_000;
+
+/// Значение `debug.tracing.screen_state` → экран включён? None — непонятное значение.
+pub fn screen_state_on(v: &str) -> Option<bool> {
+    match v.trim() {
+        "2" | "5" | "6" => Some(true),
+        "1" | "3" | "4" => Some(false),
+        _ => None,
+    }
 }
 
 impl ScreenReader {
@@ -116,15 +134,26 @@ impl ScreenReader {
                 }
             }
         }
-        ScreenReader { dpms, backlight }
+        let state = crate::sys::prop::Prop::find(SCREEN_STATE_PROP, true);
+        ScreenReader { dpms, backlight, state, state_tried_ms: util::mono_ms() }
     }
 
-    pub fn read(&self) -> Screen {
+    /// Включён ли экран. Главный источник — состояние дисплея, которое пишет сам Android: при
+    /// Always-On Display панель остаётся под питанием (`dpms` = On, подсветка > 0), и по sysfs
+    /// AOD не отличить от включённого экрана. sysfs — запасной путь, если свойства нет.
+    pub fn read(&mut self) -> Screen {
         let bright = self
             .backlight
             .as_ref()
             .and_then(|(p, max)| util::read_i64(p).map(|v| (v as f64 / max).clamp(0.0, 1.0)))
             .unwrap_or(0.0);
+        if self.state.is_none() && util::mono_ms().saturating_sub(self.state_tried_ms) >= STATE_RETRY_MS {
+            self.state = crate::sys::prop::Prop::find(SCREEN_STATE_PROP, false);
+            self.state_tried_ms = util::mono_ms();
+        }
+        if let Some(on) = self.state.as_ref().and_then(|p| p.get()).and_then(|v| screen_state_on(&v)) {
+            return Screen { on, bright };
+        }
         let on = match &self.dpms {
             Some(p) => util::read_str(p).map(|s| s == "On").unwrap_or(bright > 0.0),
             None => bright > 0.0,
@@ -447,6 +476,16 @@ pub fn gpu_busy() -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_state_values() {
+        assert_eq!(screen_state_on("2"), Some(true));
+        assert_eq!(screen_state_on("4"), Some(false)); // Always-On Display
+        assert_eq!(screen_state_on("3"), Some(false));
+        assert_eq!(screen_state_on("1"), Some(false));
+        assert_eq!(screen_state_on("0"), None);
+        assert_eq!(screen_state_on(""), None);
+    }
 
     // fdinfo с Xiaomi 15 Ultra (system_server, AlarmManager)
     const EP: &str = "pos:\t0\nflags:\t02\nmnt_id:\t13\nino:\t2052\n\

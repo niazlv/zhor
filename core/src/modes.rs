@@ -592,6 +592,9 @@ pub struct Runtime {
     /// когда Bluetooth читали последний раз (давно — условие «нет устройства» не решаем)
     #[serde(skip)]
     bt_at: i64,
+    /// `tripped` уже восстановлен из журнала после запуска ядра
+    #[serde(skip)]
+    trips_restored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -601,6 +604,22 @@ pub struct BtDev {
 }
 
 impl Runtime {
+    pub fn trips_restored(&self) -> bool {
+        self.trips_restored
+    }
+
+    /// (0.8.1) После перезапуска ядра вспомнить, кого поймало «много ест»: остановка по правилу и
+    /// запрет фона, который Жор поставил тогда же и ещё не снял. Иначе первый же пересмотр снял бы
+    /// запрет — «до конца профиля» превращалось в «до обновления Жора».
+    pub fn restore_trips(&mut self, trips: &[(u32, i64)], claims: &[crate::compare::Restr]) {
+        self.trips_restored = true;
+        for &(uid, t) in trips {
+            if claims.iter().any(|c| c.uid == Some(uid) && c.since >= t - 60_000) {
+                self.tripped.insert(uid, t);
+            }
+        }
+    }
+
     /// Пересмотреть на следующем шаге (поменяли настройки).
     pub fn poke(&mut self) {
         self.last_eval = 0;
@@ -1477,10 +1496,18 @@ mod tests {
         // повторно — нет
         i.now += WATCH_EVERY_MS;
         assert!(plan(&m, &mut rt, &i).is_empty());
+        let c = Restr { pkg: "com.example.bank".into(), uid: Some(10_300), since: i.now - WATCH_EVERY_MS, prev: "allow".into(), by: "mode".into(), kind: "bg" };
+        // ядро перезапустили: без журнала запрет сняли бы сразу, с журналом — держим до конца профиля
+        let mut fresh = Runtime::default();
+        i.claims = std::slice::from_ref(&c);
+        i.now += WATCH_EVERY_MS;
+        assert!(matches!(plan(&m, &mut fresh, &i).first(), Some(Op::Unrestrict(_))));
+        let mut fresh = Runtime::default();
+        fresh.restore_trips(&[(10_300, c.since)], std::slice::from_ref(&c));
+        assert_eq!(plan(&m, &mut fresh, &i), vec![]);
+        assert!(fresh.effective_list().iter().any(|e| e.uid == 10_300 && e.tripped));
         // профиль выключили — запрет фона по «много ест» вернуть
         m.profiles[1].when.manual = false;
-        let c = Restr { pkg: "com.example.bank".into(), uid: Some(10_300), since: now, prev: "allow".into(), by: "mode".into(), kind: "bg" };
-        i.claims = std::slice::from_ref(&c);
         i.now += WATCH_EVERY_MS;
         assert_eq!(plan(&m, &mut rt, &i), vec![Op::Unrestrict(c.clone())]);
     }

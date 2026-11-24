@@ -181,6 +181,18 @@ fn all_actions(dir: &Path) -> Vec<Action> {
     v
 }
 
+/// (0.8.1) Кого останавливало правило «только если много ест»: uid → время последней такой остановки.
+/// Нужно ядру после перезапуска, чтобы не снять запрет фона раньше конца профиля.
+pub fn watch_trips(dir: &Path) -> Vec<(u32, i64)> {
+    let mut m: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
+    for a in all_actions(dir).iter().filter(|a| a.ok && a.by == "watch" && a.action == "stop") {
+        if let Some(u) = a.uid {
+            m.insert(u, a.t);
+        }
+    }
+    m.into_iter().collect()
+}
+
 /// Ограничение, которое поставил Жор и которое до сих пор действует.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Restr {
