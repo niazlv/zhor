@@ -28,8 +28,8 @@ android {
         applicationId = "dev.niazlv.zhor"
         minSdk = 30
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.8.1"
+        versionCode = 10
+        versionName = "0.8.2"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 

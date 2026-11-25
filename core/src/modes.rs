@@ -52,6 +52,11 @@ const WATCH_WINDOW_MS: i64 = 30 * 60_000;
 const WATCH_EVERY_MS: i64 = 5 * 60_000;
 /// Возврат ограничения, которое не вышло вернуть, — не чаще.
 const RETRY_MS: i64 = 10 * 60_000;
+/// (0.8.2) У приложения служба музыки, звонка, навигации…: запрет фона откладываем и проверяем снова
+/// не раньше чем через столько. «Много ест» его не судит, пока окно ([WATCH_WINDOW_MS]) помнит эту службу.
+const BUSY_RETRY_MS: i64 = 5 * 60_000;
+/// (0.8.2) Дочитать историю Android для «не открывали» — просить не чаще.
+const HIST_ASK_MS: i64 = 15 * 60_000;
 
 fn lvl(s: &str) -> u8 {
     LEVELS.iter().position(|x| *x == s).unwrap_or(0) as u8
@@ -595,6 +600,17 @@ pub struct Runtime {
     /// `tripped` уже восстановлен из журнала после запуска ядра
     #[serde(skip)]
     trips_restored: bool,
+    /// (0.8.2) uid → когда исполнитель последний раз видел у него службу музыки, звонка, навигации…
+    #[serde(skip)]
+    busy: HashMap<u32, i64>,
+    /// (0.8.2) когда экран последний раз видели включённым
+    #[serde(skip)]
+    on_at: i64,
+    /// (0.8.2) «много ест» ждёт истории Android свежее последнего включения экрана
+    #[serde(skip)]
+    want_hist: bool,
+    #[serde(skip)]
+    hist_asked: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -618,6 +634,23 @@ impl Runtime {
                 self.tripped.insert(uid, t);
             }
         }
+    }
+
+    /// (0.8.2) Исполнитель не тронул этих: у них служба музыки, звонка, навигации… Запрет фона снимает
+    /// с приложения службу переднего плана (Android 14+) — музыка обрывается, а следующая попытка
+    /// поднять службу из фона роняет плеер. Запрет повторим позже; «много ест» с них снимаем: их
+    /// расход в окне — это и есть та служба, и запрет после неё оборвал бы следующее воспроизведение.
+    pub fn mark_busy(&mut self, uids: &[u32], now: i64) {
+        for &uid in uids {
+            self.applied.remove(&uid);
+            self.tripped.remove(&uid);
+            self.busy.insert(uid, now);
+        }
+    }
+
+    /// (0.8.2) «Много ест» ждёт свежей истории Android — ядру дочитать её (один раз на просьбу).
+    pub fn take_want_hist(&mut self) -> bool {
+        std::mem::take(&mut self.want_hist)
     }
 
     /// Пересмотреть на следующем шаге (поменяли настройки).
@@ -679,6 +712,8 @@ pub struct Inputs<'a> {
     /// когда приложение последний раз было на экране (uid → (конец, на экране сейчас)) и с какого
     /// момента есть история; None — истории Android нет, «много ест» не срабатывает
     pub last_top: Option<(&'a HashMap<u32, (i64, bool)>, i64)>,
+    /// (0.8.2) когда историю Android читали последний раз (0 — не читали)
+    pub hist_at: i64,
 }
 
 /// Пора ли пересмотреть.
@@ -748,6 +783,10 @@ pub fn plan(m: &Modes, rt: &mut Runtime, i: &Inputs) -> Vec<Op> {
     let screen_off_now = rt.last_screen == Some(true) && !i.screen_on;
     rt.last_screen = Some(i.screen_on);
     rt.last_eval = i.now;
+    if i.screen_on {
+        rt.on_at = i.now;
+    }
+    rt.busy.retain(|_, t| i.now - *t < WATCH_WINDOW_MS);
     rt.saver = i.env.saver;
     // страна: без сети — последняя известная
     if !i.env.net_country.is_empty() {
@@ -890,6 +929,10 @@ pub fn plan(m: &Modes, rt: &mut Runtime, i: &Inputs) -> Vec<Op> {
     // новые ограничения
     let uids: Vec<u32> = rt.effective.keys().copied().collect();
     for uid in uids {
+        // занято музыкой, звонком, навигацией — проверим снова позже
+        if rt.busy.get(&uid).map(|t| i.now - t < BUSY_RETRY_MS).unwrap_or(false) {
+            continue;
+        }
         if want_bg(rt, uid) && rt.applied.insert(uid) {
             if let Some(pkg) = app_pkg(i.pkgs, uid) {
                 ops.push(Op::Restrict { uid, pkg: pkg.to_string() });
@@ -1014,10 +1057,13 @@ fn watch(m: &Modes, rt: &mut Runtime, i: &Inputs) -> Vec<Op> {
         return Vec::new();
     }
     let hours = off_ms / 3_600_000.0;
+    // (0.8.2) когда экран последний раз был включён: открыть приложение можно было только тогда
+    let last_on = i.tail.iter().filter(|b| b.scr).map(|b| b.t1).max().unwrap_or(0).max(rt.on_at);
     let mut out = Vec::new();
     let cands: Vec<(u32, String)> = rt.effective.iter().filter(|(_, x)| x.0 == 1).map(|(u, x)| (*u, x.1.clone())).collect();
     for (uid, prof_id) in cands {
-        if rt.tripped.contains_key(&uid) || !i.running.contains(&uid) {
+        // занятое музыкой, звонком, навигацией — его расход в окне и есть эта служба
+        if rt.tripped.contains_key(&uid) || !i.running.contains(&uid) || rt.busy.contains_key(&uid) {
             continue;
         }
         let Some(p) = m.profiles.iter().find(|p| p.id == prof_id) else { continue };
@@ -1041,6 +1087,15 @@ fn watch(m: &Modes, rt: &mut Runtime, i: &Inputs) -> Vec<Op> {
             Some((t, false)) => format!("не открывали {}", util::fmt_dur((i.now - t) as u64)),
             None => format!("не открывали как минимум {}", util::fmt_dur((i.now - top_since) as u64)),
         };
+        // (0.8.2) «не открывали» — только по истории, прочитанной после последнего включения экрана:
+        // её читают раз в несколько часов, и старая не знает, что приложение открыли полчаса назад
+        if i.hist_at < last_on {
+            if i.now - rt.hist_asked >= HIST_ASK_MS {
+                rt.want_hist = true;
+                rt.hist_asked = i.now;
+            }
+            continue;
+        }
         let Some(pkg) = app_pkg(i.pkgs, uid) else { continue };
         rt.tripped.insert(uid, i.now);
         out.push(Op::Stop { uid, pkg: pkg.to_string(), by: "watch", why: format!("при выключенном экране {heavy}, {opened}"), profile: p.name.clone() });
@@ -1051,8 +1106,8 @@ fn watch(m: &Modes, rt: &mut Runtime, i: &Inputs) -> Vec<Op> {
     out
 }
 
-/// Остановку пропускаем, если у приложения служба с таким типом: музыка, звонок, навигация,
-/// подключённые устройства, камера, микрофон.
+/// Остановку и запрет фона (0.8.2) пропускаем, если у приложения служба с таким типом: музыка,
+/// звонок, навигация, подключённые устройства, камера, микрофон.
 const FGS_KEEP: u64 = 0x2 | 0x4 | 0x8 | 0x10 | 0x40 | 0x80;
 
 fn fgs_busy(pkg: &str, uid: u32) -> Option<String> {
@@ -1074,17 +1129,42 @@ fn parse_fgs(t: &str) -> Option<String> {
     None
 }
 
-/// Выполнить решения (вне замка демона: `cmd` — сотни мс). Возвращает строки журнала ядра и тревоги
-/// сторожу: «много ест» сообщает, кого и почему остановил.
-pub fn execute(dir: &Path, ops: Vec<Op>, mute: &[String]) -> (Vec<String>, Vec<crate::watch::Alert>) {
+/// Выполнить решения (вне замка демона: `cmd` — сотни мс). Возвращает строки журнала ядра, тревоги
+/// сторожу («много ест» сообщает, кого и почему остановил) и uid, которых не тронули из-за службы
+/// музыки, звонка, навигации… — их ядру отдать в [Runtime::mark_busy].
+pub fn execute(dir: &Path, ops: Vec<Op>, mute: &[String]) -> (Vec<String>, Vec<crate::watch::Alert>, Vec<u32>) {
     let mut log = Vec::new();
     let mut alerts = Vec::new();
+    let mut busy_uids = Vec::new();
+    // один dumpsys на приложение за проход; процессов нет — и службы нет
+    let mut seen: HashMap<u32, Option<String>> = HashMap::new();
+    let mut running: Option<std::collections::HashSet<u32>> = None;
+    let mut busy = |uid: u32, pkg: &str| -> Option<String> {
+        seen.entry(uid)
+            .or_insert_with(|| {
+                if running.get_or_insert_with(proc_uids).contains(&uid) {
+                    fgs_busy(pkg, uid)
+                } else {
+                    None
+                }
+            })
+            .clone()
+    };
     for op in ops {
         match op {
-            Op::Restrict { uid, pkg } => match compare::restrict_by(dir, &pkg, Some(uid), "mode") {
-                Some(a) => log.push(format!("профили: запрет фона {pkg} ({uid}) — {}", if a.ok { "ок" } else { "не вышло" })),
-                None => log.push(format!("профили: {pkg} ({uid}) — фон и так запрещён")),
-            },
+            Op::Restrict { uid, pkg } => {
+                // (0.8.2) запрет фона снимает с приложения службу переднего плана (Android 14+): музыка
+                // обрывается, а плеер падает, когда снова поднимает службу. Пока служба идёт — не трогаем.
+                if let Some(b) = busy(uid, &pkg) {
+                    log.push(format!("профили: фон {pkg} ({uid}) пока не запрещаю — {b}"));
+                    busy_uids.push(uid);
+                    continue;
+                }
+                match compare::restrict_by(dir, &pkg, Some(uid), "mode") {
+                    Some(a) => log.push(format!("профили: запрет фона {pkg} ({uid}) — {}", if a.ok { "ок" } else { "не вышло" })),
+                    None => log.push(format!("профили: {pkg} ({uid}) — фон и так запрещён")),
+                }
+            }
             Op::Unrestrict(r) => {
                 let res = match compare::unrestrict_one(dir, &r, "профиль больше не требует", "mode") {
                     compare::Unrestricted::Done => "вернул".to_string(),
@@ -1126,8 +1206,9 @@ pub fn execute(dir: &Path, ops: Vec<Op>, mute: &[String]) -> (Vec<String>, Vec<c
                 log.push(format!("профили: компонент {} ({}) — {res}", r.pkg, r.uid.unwrap_or(0)));
             }
             Op::Stop { uid, pkg, by, why, profile } => {
-                if let Some(busy) = fgs_busy(&pkg, uid) {
-                    log.push(format!("профиль «{profile}»: {pkg} не останавливаю — {busy}"));
+                if let Some(b) = busy(uid, &pkg) {
+                    log.push(format!("профиль «{profile}»: {pkg} не останавливаю — {b}"));
+                    busy_uids.push(uid);
                     continue;
                 }
                 let a = compare::stop_by(dir, &pkg, Some(uid), by, &format!("«{profile}»: {why}"));
@@ -1158,7 +1239,19 @@ pub fn execute(dir: &Path, ops: Vec<Op>, mute: &[String]) -> (Vec<String>, Vec<c
             }
         }
     }
-    (log, alerts)
+    busy_uids.sort_unstable();
+    busy_uids.dedup();
+    (log, alerts, busy_uids)
+}
+
+/// uid, у которых сейчас есть процессы (владелец каталога /proc/<pid>, как у сканера).
+fn proc_uids() -> std::collections::HashSet<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(rd) = std::fs::read_dir("/proc") else { return Default::default() };
+    rd.filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().map(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).unwrap_or(false))
+        .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.uid()))
+        .collect()
 }
 
 /// Минуты местного времени от полуночи.
@@ -1218,7 +1311,81 @@ mod tests {
             comp_claims: &[],
             tail: &[],
             last_top: None,
+            hist_at: 0,
         }
+    }
+
+    /// (0.8.2) Запрет фона приложению со службой музыки откладывается и пробуется снова через BUSY_RETRY_MS.
+    #[test]
+    fn busy_restrict_retried_later() {
+        let f = fx();
+        let m = modes();
+        let mut rt = Runtime::default();
+        let saver = Env { saver: true, net_country: "ru".into(), sim_country: "ru".into(), bt: None };
+        let t = 60_000;
+        let ops = plan(&m, &mut rt, &inp(&f, &saver, t, true, &[]));
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        // исполнитель увидел у «Придержать» службу музыки и не тронул
+        rt.mark_busy(&[10_100], t);
+        assert_eq!(plan(&m, &mut rt, &inp(&f, &saver, t + 60_000, true, &[])), vec![]);
+        assert_eq!(plan(&m, &mut rt, &inp(&f, &saver, t + BUSY_RETRY_MS - 1, true, &[])), vec![]);
+        assert_eq!(
+            plan(&m, &mut rt, &inp(&f, &saver, t + BUSY_RETRY_MS, true, &[])),
+            vec![Op::Restrict { uid: 10_100, pkg: "com.example.social".into() }]
+        );
+    }
+
+    /// (0.8.2) «Много ест»: «не открывали» — только по истории свежее последнего включения экрана;
+    /// занятое музыкой не судим, пока окно помнит эту службу.
+    #[test]
+    fn watch_waits_for_fresh_history_and_spares_busy() {
+        let f = fx();
+        let mut m = modes();
+        m.profiles[1].when = When { manual: true, ..Default::default() };
+        let now = 10 * 3_600_000;
+        // экран горел до now-25 мин, дальше покой (и ещё 30 мин после now); банк принимает ~6000 пакетов/ч
+        let bs: Vec<Bucket> = (0..60)
+            .map(|k| Bucket {
+                t0: now - (30 - k) * 60_000,
+                t1: now - (29 - k) * 60_000,
+                span: 60_000,
+                scr: k < 5,
+                procs: vec![ProcRec { uid: 10_300, n: "com.example.bank".into(), e: 60.0, ..Default::default() }],
+                net: vec![NetRec { u: 10_300, rp: 100, rb: 100_000, tp: 0, tb: 0 }],
+                ..Default::default()
+            })
+            .collect();
+        let tail: Vec<&Bucket> = bs.iter().collect();
+        let env = Env { saver: false, net_country: "ru".into(), sim_country: "ru".into(), bt: None };
+        let empty: HashMap<u32, (i64, bool)> = HashMap::new();
+        let mut rt = Runtime { last_screen: Some(false), ..Default::default() };
+        let mut i = inp(&f, &env, now, false, &[]);
+        i.tail = &tail;
+        i.last_top = Some((&empty, now - 20 * 3_600_000));
+        // историю читали до последнего включения экрана — ждём свежую и просим её
+        i.hist_at = now - 3 * 3_600_000;
+        assert_eq!(plan(&m, &mut rt, &i), vec![]);
+        assert!(rt.take_want_hist());
+        assert!(!rt.take_want_hist());
+        // просили недавно — второй раз не просим
+        i.now += WATCH_EVERY_MS;
+        assert_eq!(plan(&m, &mut rt, &i), vec![]);
+        assert!(!rt.take_want_hist());
+        // свежая история подтвердила «не открывали» — стоп и запрет фона
+        i.hist_at = now - 20 * 60_000;
+        i.now += WATCH_EVERY_MS;
+        let ops = plan(&m, &mut rt, &i);
+        assert!(matches!(&ops[..], [Op::Stop { uid: 10_300, by: "watch", .. }, Op::Restrict { uid: 10_300, .. }]), "{ops:?}");
+        // а у него играла музыка: не тронули — «много ест» снят, запрета после неё не будет
+        rt.mark_busy(&[10_300], i.now);
+        assert!(!rt.effective_list().iter().any(|e| e.uid == 10_300 && e.tripped));
+        let busy_at = i.now;
+        i.now += WATCH_EVERY_MS;
+        assert_eq!(plan(&m, &mut rt, &i), vec![]);
+        // окно забыло службу — судим снова
+        i.now = busy_at + WATCH_WINDOW_MS;
+        let ops = plan(&m, &mut rt, &i);
+        assert!(matches!(&ops[..], [Op::Stop { uid: 10_300, .. }, Op::Restrict { uid: 10_300, .. }]), "{ops:?}");
     }
 
     #[test]

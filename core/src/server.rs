@@ -20,6 +20,7 @@ pub const SOCK: &str = "zhord";
 static STOP: AtomicBool = AtomicBool::new(false);
 static SNAP_RUNNING: AtomicBool = AtomicBool::new(false);
 static MODES_RUNNING: AtomicBool = AtomicBool::new(false);
+static HIST_RUNNING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
@@ -138,6 +139,18 @@ fn ingest_history(d: &Arc<Mutex<Daemon>>, dir: &PathBuf, hist: Option<Arc<Mutex<
     };
 }
 
+/// (0.8.2) Дочитать историю Android в своём потоке: «много ест» не судит «не открывали» по истории
+/// старше последнего включения экрана.
+fn spawn_hist(d: Arc<Mutex<Daemon>>, dir: PathBuf) {
+    if HIST_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        refresh_history(&d, &dir);
+        HIST_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
 /// Только история (без снимка): когда отчёт смотрят, а история старше 5 мин.
 fn refresh_history(d: &Arc<Mutex<Daemon>>, dir: &PathBuf) {
     let now = util::real_ms();
@@ -173,9 +186,15 @@ fn spawn_deliver(d: Arc<Mutex<Daemon>>, dir: PathBuf, alerts: Vec<crate::watch::
 /// (0.8) Выполнить решения режимов вне замка; тревоги авто-уборки — сторожу.
 fn spawn_modes(d: Arc<Mutex<Daemon>>, dir: PathBuf, ops: Vec<crate::modes::Op>, mute: Vec<String>) {
     std::thread::spawn(move || {
-        let (lines, alerts) = crate::modes::execute(&dir, ops, &mute);
+        let (lines, alerts, busy) = crate::modes::execute(&dir, ops, &mute);
         for l in lines {
             log(&dir, &l);
+        }
+        // (0.8.2) не тронутых из-за музыки, звонка, навигации — пересмотр попробует позже
+        if !busy.is_empty() {
+            if let Ok(mut g) = d.lock() {
+                g.mode_rt.mark_busy(&busy, util::real_ms());
+            }
         }
         for mut a in alerts {
             let (ok, _) = crate::watch::deliver(&a);
@@ -197,7 +216,13 @@ fn modes_now(d: Arc<Mutex<Daemon>>, dir: PathBuf) {
         let want_bt = d.lock().map(|g| g.modes.profiles.iter().any(|p| p.on && !p.when.bt_away.is_empty())).unwrap_or(false);
         let env = crate::modes::Env::read(want_bt);
         let (ops, mute) = match d.lock() {
-            Ok(mut g) => (g.modes_plan(&env), g.config.watch_mute.clone()),
+            Ok(mut g) => {
+                let ops = g.modes_plan(&env);
+                if g.mode_rt.take_want_hist() {
+                    spawn_hist(d.clone(), dir.clone());
+                }
+                (ops, g.config.watch_mute.clone())
+            }
             Err(_) => (Vec::new(), Vec::new()),
         };
         if ops.is_empty() {
@@ -338,6 +363,9 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
                     }
                     Ok(_) => {}
                     Err(_) => log(&dir, "паника в профилях — пропуск"),
+                }
+                if g.mode_rt.take_want_hist() {
+                    spawn_hist(d.clone(), dir.clone());
                 }
             }
             if g.snap_due(util::real_ms()) && !SNAP_RUNNING.load(Ordering::SeqCst) {

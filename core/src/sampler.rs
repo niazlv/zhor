@@ -656,6 +656,7 @@ impl Daemon {
             comp_claims: &comp_claims,
             tail: &tail,
             last_top: top.as_ref().map(|(m, s)| (m, *s)),
+            hist_at: self.last_hist_real,
         };
         crate::modes::plan(&self.modes, &mut self.mode_rt, &inputs)
     }
