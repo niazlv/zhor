@@ -2,7 +2,7 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [SemVer](https://semver.org/lang/ru/).
 
-## [Не выпущено]
+## [0.8.3] — 2026-11-27
 
 ### Добавлено
 
@@ -200,6 +200,7 @@
   «Почему столько», «Сон», «За кого работает system», «Сейчас».
 - Настройки: частота шага, срок хранения, автозапуск, подробная история Android; размер данных и выгрузка.
 
+[0.8.3]: https://github.com/niazlv/zhor/releases/tag/v0.8.3
 [0.8.2]: https://github.com/niazlv/zhor/releases/tag/v0.8.2
 [0.8.1]: https://github.com/niazlv/zhor/releases/tag/v0.8.1
 [0.8.0]: https://github.com/niazlv/zhor/releases/tag/v0.8.0
