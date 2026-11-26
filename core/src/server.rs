@@ -355,6 +355,17 @@ pub fn run_daemon(dir: PathBuf) -> i32 {
                 Ok(_) => {}
                 Err(_) => log(&dir, "паника в стороже — пропуск"),
             }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.usb_eval())) {
+                Ok((alerts, line)) => {
+                    if let Some(l) = line {
+                        log(&dir, &l);
+                    }
+                    if !alerts.is_empty() {
+                        spawn_deliver(d.clone(), dir.clone(), alerts);
+                    }
+                }
+                Err(_) => log(&dir, "паника в проверке USB — пропуск"),
+            }
             if !MODES_RUNNING.load(Ordering::SeqCst) {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.modes_plan(&env))) {
                     Ok(ops) if !ops.is_empty() => {

@@ -69,6 +69,7 @@ fun ruleName(rule: String) = when (rule) {
     "wakeups" -> "Частые пробуждения"
     "app_bg" -> "Работает в фоне"
     "hot" -> "Греется с выключенным экраном"
+    "usb_flap" -> "USB-порт мигает"
     "test" -> "Проверка"
     else -> rule
 }

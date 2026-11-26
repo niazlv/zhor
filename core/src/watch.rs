@@ -276,7 +276,7 @@ pub struct Alert {
     /// правило:виновник@начало периода — одна тревога на период
     pub id: String,
     pub t: i64,
-    /// no_sleep | idle_drain | wakeups | app_bg | hot | test
+    /// no_sleep | idle_drain | wakeups | app_bg | hot | usb_flap | test
     pub rule: String,
     /// ключ для «не напоминать»: правило или правило:виновник
     pub key: String,
@@ -409,6 +409,15 @@ impl Watch {
             .collect();
         self.last_cost_us = t0.elapsed().as_micros() as u64;
         fresh
+    }
+
+    /// (0.8.3) Тревога мимо правил покоя (мигание USB): сторож выключен, «не напоминать» или уже
+    /// была — None.
+    pub fn admit(&mut self, cfg: &Config, a: Alert) -> Option<Alert> {
+        if !cfg.watch || cfg.watch_mute.iter().any(|m| *m == a.key || *m == a.rule) {
+            return None;
+        }
+        self.fired.insert(a.id.clone()).then_some(a)
     }
 
     /// Записать тревогу (после попытки доставки).
@@ -701,6 +710,35 @@ fn rules(period: &[&Bucket], start: i64, cfg: &Config, full_mah: Option<f64>, pk
         }
     }
     out
+}
+
+/// (0.8.3) «USB-порт мигает». `now_us` и `f.first_us` — время с загрузки по часам ядра, мкс.
+pub fn usb_flap_alert(f: &crate::usbport::Flap, now: i64, now_us: u64, boot: &str) -> Alert {
+    let from = now - (now_us.saturating_sub(f.first_us) / 1000) as i64;
+    // ядро пишет время с загрузки: мигание в первые минуты — сразу после перезагрузки
+    let after_boot = if f.first_us < 5 * 60 * 1_000_000 { " сразу после загрузки телефона" } else { "" };
+    let text = format!(
+        "Разъём USB-C {} раз за {} включил режим USB-хоста и тут же выключил{after_boot}. Так не ведёт себя ни зарядка, \
+         ни подключённое устройство: обычно это влага или грязь в разъёме, повреждённый кабель или переходник. Пока порт \
+         мигает, телефон не засыпает, а на некоторых моделях через несколько минут случается паника ядра и перезагрузка. \
+         Отключите кабель и переходники, просушите и прочистите разъём — не металлом.",
+        f.n,
+        fmt_dur((f.span_us / 1000).max(1000))
+    );
+    Alert {
+        id: format!("usb_flap@{boot}:{}", f.first_seq),
+        t: now,
+        rule: "usb_flap".into(),
+        key: "usb_flap".into(),
+        level: "bad".into(),
+        title: "USB-порт мигает".into(),
+        text,
+        uid: None,
+        pkg: None,
+        from,
+        to: now,
+        sent: false,
+    }
 }
 
 /// Отправить тревогу приложению. → (доставлено, вывод cmd)
@@ -998,5 +1036,31 @@ mod tests {
         v[17].temp = 38.0;
         let mut w2 = Watch::scratch();
         assert!(w2.eval(&refs(&v), &cfg(), Some(5000.0), &BTreeMap::new(), 20 * 60_000).iter().all(|a| a.rule != "hot"));
+    }
+
+    #[test]
+    fn usb_flap_alert_once_and_mutable() {
+        let s = 1_000_000u64;
+        // мигание началось на 4-й секунде после загрузки, сейчас 100-я
+        let f = crate::usbport::Flap { n: 252, span_us: 96 * s, first_seq: 48_123, first_us: 4 * s };
+        let now = 1_795_722_976_000i64;
+        let a = usb_flap_alert(&f, now, 100 * s, "1a2b3c4d");
+        assert_eq!(a.id, "usb_flap@1a2b3c4d:48123");
+        assert_eq!((a.rule.as_str(), a.level.as_str()), ("usb_flap", "bad"));
+        assert_eq!(a.from, now - 96_000);
+        assert!(a.text.contains("252 раз за 1 мин 36 с"), "{}", a.text);
+        assert!(a.text.contains("сразу после загрузки"));
+        let mut w = Watch::scratch();
+        let c = cfg();
+        assert!(w.admit(&c, a.clone()).is_some());
+        // та же тревога (перезапуск демона в той же загрузке) — второй раз не показываем
+        assert!(w.admit(&c, a.clone()).is_none());
+        let mut w = Watch::scratch();
+        let mut muted = cfg();
+        muted.watch_mute = vec!["usb_flap".into()];
+        assert!(w.admit(&muted, a.clone()).is_none());
+        let mut off = cfg();
+        off.watch = false;
+        assert!(Watch::scratch().admit(&off, a).is_none());
     }
 }

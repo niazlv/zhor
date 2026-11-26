@@ -98,6 +98,8 @@ pub struct Daemon {
     pub modes: crate::modes::Modes,
     pub mode_rt: crate::modes::Runtime,
     pub protect: crate::modes::Protect,
+    /// (0.8.3) мигание порта USB-C по журналу ядра
+    pub usb: crate::usbport::UsbPort,
 }
 
 /// Как часто снимать сеть по приложениям (плюс каждая смена экрана и зарядки).
@@ -191,6 +193,7 @@ impl Daemon {
             modes: crate::modes::Modes::load(&dir),
             mode_rt: crate::modes::Runtime::default(),
             protect: crate::modes::Protect::default(),
+            usb: crate::usbport::UsbPort::open(),
         };
         d.load_events();
         d.load_snaps();
@@ -689,6 +692,29 @@ impl Daemon {
             self.want_snap = true;
         }
         alerts
+    }
+
+    /// (0.8.3) Мигание порта USB-C — на каждом шаге, при любом экране и зарядке: правила сторожа
+    /// смотрят только покой без зарядки и раз в 5 минут, а паника бывает через несколько минут после
+    /// начала мигания. → новые тревоги и строка в журнал (не чаще раза в минуту, пока мигает).
+    pub fn usb_eval(&mut self) -> (Vec<crate::watch::Alert>, Option<String>) {
+        self.usb.poll();
+        let now_us = util::mono_ms() * 1000;
+        let mut line = None;
+        if self.usb.pending > 0 && now_us.saturating_sub(self.usb.logged_us) >= 60_000_000 {
+            let since = if self.usb.logged_us == 0 { "с загрузки".to_string() } else { format!("за {}", util::fmt_dur((now_us - self.usb.logged_us) / 1000)) };
+            line = Some(format!("USB-C: порт включал режим хоста {} раз {since}", self.usb.pending));
+            self.usb.pending = 0;
+            self.usb.logged_us = now_us;
+        }
+        let alerts = match self.usb.det.check(now_us) {
+            Some(f) => {
+                let a = crate::watch::usb_flap_alert(&f, util::real_ms(), now_us, &self.usb.boot);
+                self.watch.admit(&self.config, a).into_iter().collect()
+            }
+            None => Vec::new(),
+        };
+        (alerts, line)
     }
 
     pub fn current(&self) -> Option<(Battery, Screen)> {

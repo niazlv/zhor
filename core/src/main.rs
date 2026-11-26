@@ -26,6 +26,7 @@ mod compare;
 mod guard;
 mod modes;
 mod update;
+mod usbport;
 
 use serde_json::json;
 use std::path::PathBuf;
