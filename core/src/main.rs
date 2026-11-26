@@ -228,9 +228,16 @@ fn main() {
             }
             all.sort_by_key(|b| b.t0);
             let pkgs = sys::packages();
+            let users: std::collections::BTreeSet<u32> = pkgs.keys().map(|u| u / 100_000).collect();
+            let vpn = sys::netstat::vpn_packages(&users);
             let br = sysfs::BatteryReader::new();
             let cap = br.full_capacity_mah().or(br.design_capacity_mah());
             let refs: Vec<&store::Bucket> = all.iter().collect();
+            // (0.8.3) снимки batterystats — для блокировок сна приложений в «Телефон не спит»
+            let mut snaps: Vec<sys::SysSnap> = std::fs::read_to_string(dir.join("snaps.jsonl"))
+                .map(|t| t.lines().filter_map(|l| serde_json::from_str::<sys::SysSnap>(l).ok()).filter(|s| s.t >= cut).collect())
+                .unwrap_or_default();
+            snaps.sort_by_key(|s| s.t);
             let mut w = watch::Watch::scratch();
             // --fast: сроки правил ×0,2 (30 мин покоя → 6) — посмотреть тексты на коротких записях
             if args.iter().any(|a| a == "--fast") {
@@ -245,7 +252,9 @@ fn main() {
                     continue;
                 }
                 last = now;
-                for a in w.eval(&refs[..=i], &cfg, cap, &pkgs, now) {
+                let sn: Vec<&sys::SysSnap> = snaps.iter().take_while(|s| s.t <= now).collect();
+                let x = watch::Extra { snaps: &sn, vpn: Some(&vpn) };
+                for a in w.eval_with(&refs[..=i], x, &cfg, cap, &pkgs, now) {
                     println!("\n{} [{}] {}\n  {}", report::fmt_time(now), a.level, a.title, a.text);
                 }
                 n += 1;

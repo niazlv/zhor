@@ -958,7 +958,7 @@ pub fn build(d: &Daemon, q: &Query, extra_snap: Option<&SysSnap>) -> Report {
 }
 
 /// Источник пробуждения от входящих пакетов: Some(true) — Wi-Fi, Some(false) — мобильная сеть.
-fn net_ws_kind(name: &str) -> Option<bool> {
+pub(crate) fn net_ws_kind(name: &str) -> Option<bool> {
     let l = name.to_ascii_lowercase();
     if l == "qcom_rx_wakelock" || l.starts_with("wlan_rx") || l.contains("wlan_wake") || l == "wlan_rx_wake" {
         Some(true)

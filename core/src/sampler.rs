@@ -681,7 +681,14 @@ impl Daemon {
         }
         tail.reverse();
         let cap = self.full_mah.or(self.design_mah);
-        self.watch.eval(&tail, &self.config, cap, &self.pkgs, now)
+        let snaps: Vec<&sys::SysSnap> = self.snaps.iter().collect();
+        let x = crate::watch::Extra { snaps: &snaps, vpn: Some(&self.vpn_pkgs) };
+        let alerts = self.watch.eval_with(&tail, x, &self.config, cap, &self.pkgs, now);
+        // (0.8.3) «Телефон не спит» ждёт свежий снимок — снимет поток снимков в этом же шаге
+        if self.watch.take_want_snap() {
+            self.want_snap = true;
+        }
+        alerts
     }
 
     pub fn current(&self) -> Option<(Battery, Screen)> {

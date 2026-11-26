@@ -9,9 +9,10 @@ use crate::data::Config;
 use crate::explain;
 use crate::report::label_for;
 use crate::store::Bucket;
+use crate::sys::SysSnap;
 use crate::util::{self, fmt_dur};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
@@ -22,6 +23,32 @@ const GAP_MS: i64 = 5 * 60_000;
 /// Тревоги в памяти и на диске.
 const KEEP_MS: i64 = 14 * 86_400_000;
 const KEEP_N: usize = 300;
+
+/// (0.8.3) Блокировки сна приложений за период — разностью снимков batterystats (см. [app_holds]).
+/// Снимок «на начале периода» снимается по смене экрана, бывает на пару минут позже первой корзины.
+const HOLD_BASE_SLACK_MS: i64 = 3 * 60_000;
+/// Снимок раньше начала периода больше чем на столько — в разность попал бы включённый экран: не считаем.
+const HOLD_BASE_AGE_MS: i64 = 10 * 60_000;
+/// Последний снимок не старше этого — блокировки за период известны (почти) целиком.
+const HOLD_FRESH_MS: i64 = 8 * 60_000;
+/// Сколько «Телефон не спит» ждёт свежий снимок, прежде чем уйти без блокировок приложений.
+const HOLD_WAIT_MS: i64 = 12 * 60_000;
+/// Блокировки короче — не виновник.
+const HOLD_MIN_MS: u64 = 60_000;
+/// (0.8.3) «Частые пробуждения» от сети называют приложение, если входящих пакетов за период хотя бы
+/// столько и его доля не меньше [NET_SHARE_MIN] (второе — от [NET_SHARE_NEXT]).
+const NET_MIN_PACKETS: u64 = 100;
+const NET_SHARE_MIN: f64 = 0.25;
+const NET_SHARE_NEXT: f64 = 0.2;
+
+/// (0.8.3) Что сторожу нужно помимо корзин.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Extra<'a> {
+    /// снимки batterystats по времени — блокировки сна приложений
+    pub snaps: &'a [&'a SysSnap],
+    /// пакеты VPN-служб: их туннель в «кому шли пакеты» не считается — это те же пакеты приложений
+    pub vpn: Option<&'a BTreeSet<String>>,
+}
 
 pub const APP_PKG: &str = "dev.niazlv.zhor";
 pub const ALERT_ACTION: &str = "dev.niazlv.zhor.ALERT";
@@ -278,6 +305,13 @@ pub struct Watch {
     pub last_cost_us: u64,
     /// множитель минимальных сроков правил (1 — как есть; меньше — только для `watch-check --fast`)
     pub min_scale: f64,
+    /// (0.8.3) «Телефон не спит» ждёт свежий снимок ради блокировок приложений (у прогона по истории — нет:
+    /// новых снимков там не будет)
+    defer: bool,
+    /// (начало периода, когда попросили снимок) — ждём не дольше [HOLD_WAIT_MS]
+    hold_wait: Option<(i64, i64)>,
+    /// попросить у демона внеочередной снимок
+    want_snap: bool,
 }
 
 fn ma_text(v: f64) -> String {
@@ -286,7 +320,7 @@ fn ma_text(v: f64) -> String {
 
 impl Watch {
     pub fn open(dir: PathBuf) -> Self {
-        let mut w = Watch { dir, alerts: VecDeque::new(), fired: HashSet::new(), last_eval: 0, last_cost_us: 0, min_scale: 1.0 };
+        let mut w = Watch { dir, alerts: VecDeque::new(), fired: HashSet::new(), last_eval: 0, last_cost_us: 0, min_scale: 1.0, defer: true, hold_wait: None, want_snap: false };
         let cut = util::real_ms() - KEEP_MS;
         let mut dropped = false;
         if let Ok(f) = std::fs::File::open(w.path()) {
@@ -313,7 +347,12 @@ impl Watch {
 
     /// Сторож без журнала на диске — для прогона правил по записанной истории (`zhord watch-check`).
     pub fn scratch() -> Self {
-        Watch { dir: PathBuf::from("/nonexistent"), alerts: VecDeque::new(), fired: HashSet::new(), last_eval: 0, last_cost_us: 0, min_scale: 1.0 }
+        Watch { dir: PathBuf::from("/nonexistent"), alerts: VecDeque::new(), fired: HashSet::new(), last_eval: 0, last_cost_us: 0, min_scale: 1.0, defer: false, hold_wait: None, want_snap: false }
+    }
+
+    /// (0.8.3) Сторож просит внеочередной снимок batterystats (для блокировок сна в «Телефон не спит»).
+    pub fn take_want_snap(&mut self) -> bool {
+        std::mem::take(&mut self.want_snap)
     }
 
     fn path(&self) -> PathBuf {
@@ -325,14 +364,41 @@ impl Watch {
     }
 
     /// Проверить правила по хвосту корзин. Возвращает новые тревоги (ещё не записанные).
+    #[cfg(test)]
     pub fn eval(&mut self, buckets: &[&Bucket], cfg: &Config, full_mah: Option<f64>, pkgs: &BTreeMap<u32, Vec<String>>, now: i64) -> Vec<Alert> {
+        self.eval_with(buckets, Extra::default(), cfg, full_mah, pkgs, now)
+    }
+
+    /// То же, со снимками batterystats (из них — блокировки сна приложений за период) и VPN-пакетами.
+    pub fn eval_with(&mut self, buckets: &[&Bucket], x: Extra, cfg: &Config, full_mah: Option<f64>, pkgs: &BTreeMap<u32, Vec<String>>, now: i64) -> Vec<Alert> {
         self.last_eval = now;
         if !cfg.watch {
             return Vec::new();
         }
         let t0 = std::time::Instant::now();
         let out = match current_period(buckets, now) {
-            Some((start, i)) => rules(&buckets[i..], start, cfg, full_mah, pkgs, now, self.min_scale),
+            Some((start, i)) => {
+                let holds = app_holds(x.snaps, start, now);
+                let mut out = rules(&buckets[i..], start, cfg, full_mah, pkgs, now, self.min_scale, &holds, x.vpn);
+                // Снимок старый — блокировок приложений за период не видно. «Не спит» придержать до свежего
+                // (его снимут в этом же шаге), но не дольше HOLD_WAIT_MS: снимок мог не получиться.
+                if holds.wait && self.defer {
+                    if let Some(pos) = out.iter().position(|a| a.rule == "no_sleep" && !self.fired.contains(&a.id)) {
+                        let asked = match self.hold_wait {
+                            Some((s, t)) if s == start => t,
+                            _ => {
+                                self.hold_wait = Some((start, now));
+                                now
+                            }
+                        };
+                        if now - asked < HOLD_WAIT_MS {
+                            out.remove(pos);
+                            self.want_snap = true;
+                        }
+                    }
+                }
+                out
+            }
             None => Vec::new(),
         };
         let mute: HashSet<&str> = cfg.watch_mute.iter().map(|s| s.as_str()).collect();
@@ -393,8 +459,95 @@ impl Watch {
     }
 }
 
+/// (0.8.3) Блокировки сна приложений за период покоя. В корзинах их нет: приложение держит процессор через
+/// suspend-service («PowerManagerService.WakeLocks»), а не своим источником пробуждения ядра, — и сторож
+/// винил Wi-Fi, пока почта держала телефон 9 минут из 35. Берём разность частичных wakelock по uid между
+/// снимком у начала периода и последним.
+#[derive(Debug, Clone, Default)]
+pub struct AppHolds {
+    /// последний снимок старый — свежий покажет блокировки за период целиком
+    pub wait: bool,
+    /// (uid, тег, мс) по убыванию. На uid — самый долгий тег, не сумма: теги одного приложения обычно
+    /// вложены (задача JobScheduler и wakelock внутри неё), сумма их удвоила бы.
+    pub top: Vec<(u32, String, u64)>,
+}
+
+pub fn app_holds(snaps: &[&SysSnap], start: i64, now: i64) -> AppHolds {
+    let Some(bi) = snaps.iter().rposition(|s| s.t <= start + HOLD_BASE_SLACK_MS) else {
+        return AppHolds::default();
+    };
+    let (base, last) = (snaps[bi], snaps[snaps.len() - 1]);
+    // снимка у начала периода нет — разность была бы не про покой, и свежий снимок этого не исправит
+    if base.t < start - HOLD_BASE_AGE_MS {
+        return AppHolds::default();
+    }
+    let wait = now - last.t > HOLD_FRESH_MS;
+    if last.t <= base.t {
+        return AppHolds { wait, top: Vec::new() };
+    }
+    // Android обнулил статистику (перезагрузка, отключение после полной зарядки) — разность бессмысленна
+    if last.checkin.start_clock_ms != base.checkin.start_clock_ms {
+        return AppHolds::default();
+    }
+    let mut top: Vec<(u32, String, u64)> = last
+        .checkin
+        .uids
+        .iter()
+        .filter_map(|(uid, u)| {
+            let old = base.checkin.uids.get(uid);
+            let d: Vec<(&String, u64)> = u.wakelocks.iter().map(|(n, w)| (n, w.ms.saturating_sub(old.and_then(|o| o.wakelocks.get(n)).map(|o| o.ms).unwrap_or(0)))).collect();
+            let (n, ms) = d.iter().max_by_key(|x| x.1).copied().filter(|x| x.1 >= HOLD_MIN_MS)?;
+            // задача или синхронизация почти той же длины говорит больше, чем «App:WakeLock» внутри неё
+            let named = d.iter().filter(|x| (x.0.starts_with("*job*") || x.0.starts_with("*sync*")) && x.1 * 10 >= ms * 9).max_by_key(|x| x.1).map(|x| x.0).unwrap_or(n);
+            Some((*uid, named.clone(), ms))
+        })
+        .collect();
+    top.sort_by_key(|x| std::cmp::Reverse(x.2));
+    top.truncate(3);
+    AppHolds { wait, top }
+}
+
+/// Тег блокировки сна покороче: «*job*r/pkg/.mail.ews.push.EwsPushJobService» → «задача EwsPushJobService»,
+/// «*job*r/#UpdateTask#@androidx.work…» → «задача UpdateTask», «*sync*/…» → «синхронизация».
+fn wl_tag(tag: &str) -> String {
+    if let Some(rest) = tag.strip_prefix("*job*") {
+        let rest = rest.trim_start_matches(|c: char| c.is_ascii_lowercase()).trim_start_matches('/');
+        let name = match rest.strip_prefix('#') {
+            Some(r) => r.split('#').next().unwrap_or(r),
+            None => rest.rsplit(['/', '.']).find(|p| !p.is_empty()).unwrap_or(rest),
+        };
+        return format!("задача {name}");
+    }
+    if tag.starts_with("*sync*") {
+        return "синхронизация".into();
+    }
+    if tag.starts_with("*alarm*") {
+        return "будильник".into();
+    }
+    tag.chars().take(48).collect()
+}
+
+/// (0.8.3) Кому шли входящие пакеты за период: (uid, пакетов, байт) по убыванию и всего пакетов.
+/// VPN-службы не в счёт: их туннель — те же пакеты приложений (как в «Кто будит по сети» отчёта).
+fn net_top(period: &[&Bucket], pkgs: &BTreeMap<u32, Vec<String>>, vpn: Option<&BTreeSet<String>>) -> (Vec<(u32, u64, u64)>, u64) {
+    let is_vpn = |uid: u32| vpn.zip(pkgs.get(&uid)).map(|(v, ps)| ps.iter().any(|p| v.contains(p))).unwrap_or(false);
+    let mut m: HashMap<u32, (u64, u64)> = HashMap::new();
+    for b in period.iter().filter(|b| !b.scr && !b.plug) {
+        for r in &b.net {
+            let e = m.entry(r.u).or_default();
+            e.0 += r.rp;
+            e.1 += r.rb;
+        }
+    }
+    let mut v: Vec<(u32, u64, u64)> = m.into_iter().filter(|(u, _)| !is_vpn(*u)).map(|(u, (p, b))| (u, p, b)).collect();
+    let total = v.iter().map(|x| x.1).sum();
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
+    (v, total)
+}
+
 /// Правила по текущему периоду покоя.
-fn rules(period: &[&Bucket], start: i64, cfg: &Config, full_mah: Option<f64>, pkgs: &BTreeMap<u32, Vec<String>>, now: i64, scale: f64) -> Vec<Alert> {
+#[allow(clippy::too_many_arguments)]
+fn rules(period: &[&Bucket], start: i64, cfg: &Config, full_mah: Option<f64>, pkgs: &BTreeMap<u32, Vec<String>>, now: i64, scale: f64, holds: &AppHolds, vpn: Option<&BTreeSet<String>>) -> Vec<Alert> {
     let st = OffStats::over(period.iter().copied(), i64::MIN, i64::MAX);
     let mut out = Vec::new();
     let off = st.off_ms as u64;
@@ -431,15 +584,30 @@ fn rules(period: &[&Bucket], start: i64, cfg: &Config, full_mah: Option<f64>, pk
     if cfg.watch_sleep_pct > 0.0 && off >= min(30) && st.deep_pct() < cfg.watch_sleep_pct {
         let deep = st.deep_pct();
         let mut text = format!("Экран выключен {}, а в глубоком сне телефон провёл {:.0} % этого времени.", fmt_dur(off), deep);
-        if let Some((n, ms)) = st.top_holder() {
-            text += &format!(" Дольше всех не даёт спать «{n}» ({}).", fmt_dur(ms as u64));
+        // (0.8.3) источник ядра или блокировка сна приложения — кто дольше
+        let mut culprit = None;
+        match (holds.top.first(), st.top_holder()) {
+            (Some((u, tag, ms)), k) if k.as_ref().map(|(_, kms)| *ms as f64 >= *kms).unwrap_or(true) => {
+                text += &format!(" Дольше всех не даёт спать {}: блокировка сна «{}» ({}).", label(*u), wl_tag(tag), fmt_dur(*ms));
+                culprit = Some(*u);
+            }
+            (app, Some((n, kms))) => {
+                text += &format!(" Дольше всех не даёт спать «{n}» ({}).", fmt_dur(kms as u64));
+                if let Some((u, tag, ms)) = app {
+                    text += &format!(" Из приложений дольше всех держит блокировку сна {}: «{}» ({}).", label(*u), wl_tag(tag), fmt_dur(*ms));
+                    culprit = Some(*u);
+                }
+            }
+            _ => {}
         }
         let top = top_cpu();
         if let Some((_, t)) = &top {
             text += t;
         }
         let lvl = if deep < cfg.watch_sleep_pct / 2.0 { "bad" } else { "warn" };
-        out.push(mk("no_sleep", None, lvl, "Телефон не спит".into(), text, top.map(|(u, _)| u).filter(|u| explain::uid_kind(*u) == "app")));
+        let is_app = |u: &u32| explain::uid_kind(*u) == "app";
+        let uid = culprit.filter(is_app).or(top.map(|(u, _)| u).filter(is_app));
+        out.push(mk("no_sleep", None, lvl, "Телефон не спит".into(), text, uid));
     }
 
     // 2. батарея тает в покое
@@ -466,10 +634,29 @@ fn rules(period: &[&Bucket], start: i64, cfg: &Config, full_mah: Option<f64>, pk
             let per_h = c / st.hours().max(0.01);
             if c >= 50.0 && per_h > cfg.watch_wakeups_h {
                 let why = explain::wakeup_source(&n).map(|e| format!(" {e}")).unwrap_or_default();
-                let text = format!("«{n}» будит телефон ~{per_h:.0} раз в час ({:.0} за {}).{why}", c, fmt_dur(off));
+                let mut text = format!("«{n}» будит телефон ~{per_h:.0} раз в час ({:.0} за {}).{why}", c, fmt_dur(off));
+                // (0.8.3) будит сеть — назвать, кому шли пакеты, а не отсылать к экрану «Сон»
+                let mut uid = None;
+                if crate::report::net_ws_kind(&n).is_some() {
+                    let (top, total) = net_top(period, pkgs, vpn);
+                    let share = |p: u64| p as f64 / total.max(1) as f64;
+                    if let Some(&(u, p, bytes)) = top.first().filter(|x| total >= NET_MIN_PACKETS && share(x.1) >= NET_SHARE_MIN) {
+                        text += &format!(
+                            " Больше всех входящих пакетов получило {}: {:.0} % (~{:.0} в час, {}).",
+                            label(u),
+                            100.0 * share(p),
+                            p as f64 / st.hours().max(0.01),
+                            util::fmt_bytes(bytes)
+                        );
+                        if let Some(&(u2, p2, _)) = top.get(1).filter(|x| share(x.1) >= NET_SHARE_NEXT) {
+                            text += &format!(" Следом — {}: {:.0} %.", label(u2), 100.0 * share(p2));
+                        }
+                        uid = Some(u).filter(|u| explain::uid_kind(*u) == "app");
+                    }
+                }
                 let lvl = if per_h > 4.0 * cfg.watch_wakeups_h { "bad" } else { "warn" };
                 // «[timerfd] #6» → ключ «[timerfd]»: номер экземпляра меняется после перезагрузки
-                out.push(mk("wakeups", Some(base_name(&n)), lvl, format!("Частые пробуждения: {n}"), text, None));
+                out.push(mk("wakeups", Some(base_name(&n)), lvl, format!("Частые пробуждения: {n}"), text, uid));
             }
         }
     }
@@ -600,7 +787,7 @@ mod tests {
             v.push(x);
         }
         let now = 40 * 60_000;
-        let mut w = Watch { dir: std::env::temp_dir(), alerts: VecDeque::new(), fired: HashSet::new(), last_eval: 0, last_cost_us: 0, min_scale: 1.0 };
+        let mut w = Watch { dir: std::env::temp_dir(), ..Watch::scratch() };
         let pk = BTreeMap::new();
         let a = w.eval(&refs(&v), &cfg(), Some(5000.0), &pk, now);
         let rules: Vec<&str> = a.iter().map(|a| a.rule.as_str()).collect();
@@ -622,6 +809,155 @@ mod tests {
         let a2 = w.eval(&refs(&shifted), &c, Some(5000.0), &pk, now + 10_000_000);
         assert!(a2.iter().all(|a| a.rule != "wakeups"));
         assert!(a2.iter().any(|a| a.rule == "no_sleep"));
+    }
+
+    /// Снимок с частичными wakelock: [(uid, тег, мс)].
+    fn snap(t: i64, start_clock: i64, wl: &[(u32, &str, u64)]) -> SysSnap {
+        let mut s = SysSnap { t, ..Default::default() };
+        s.checkin.start_clock_ms = start_clock;
+        for (uid, tag, ms) in wl {
+            s.checkin.uids.entry(*uid).or_default().wakelocks.insert(tag.to_string(), crate::sys::checkin::Wl { ms: *ms, ..Default::default() });
+        }
+        s
+    }
+
+    const JOB: &str = "*job*r/com.example.mail/.mail.ews.push.EwsPushJobService";
+
+    #[test]
+    fn app_holds_takes_longest_tag_per_app() {
+        let base = snap(60_000, 1, &[(10_330, JOB, 1_000), (10_330, "Mail:WakeLock", 1_000), (10_500, "*sync*/x", 0)]);
+        let last = snap(40 * 60_000, 1, &[(10_330, JOB, 541_000), (10_330, "Mail:WakeLock", 539_000), (10_500, "*sync*/x", 30_000)]);
+        let h = app_holds(&[&base, &last], 0, 41 * 60_000);
+        assert!(!h.wait);
+        // вложенные теги не складываются; меньше минуты — не виновник
+        assert_eq!(h.top, vec![(10_330, JOB.to_string(), 540_000)]);
+        // последний снимок старый — ждать свежий
+        assert!(app_holds(&[&base, &last], 0, 60 * 60_000).wait);
+        // только снимок у начала — ждать; разность ещё пустая
+        let h1 = app_holds(&[&base], 0, 30 * 60_000);
+        assert!(h1.wait && h1.top.is_empty());
+        // свой wakelock чуть длиннее задачи — время его, а имя задачи (понятнее)
+        let last_w = snap(40 * 60_000, 1, &[(10_330, JOB, 538_000), (10_330, "Mail:WakeLock", 541_000)]);
+        assert_eq!(app_holds(&[&base, &last_w], 0, 41 * 60_000).top, vec![(10_330, JOB.to_string(), 540_000)]);
+        // Android обнулил статистику — ни ждать, ни считать
+        let reset = snap(40 * 60_000, 2, &[(10_330, JOB, 5_000)]);
+        let h2 = app_holds(&[&base, &reset], 0, 41 * 60_000);
+        assert!(!h2.wait && h2.top.is_empty());
+        // снимка у начала периода нет (последний перед ним — на 20 мин раньше)
+        let h3 = app_holds(&[&base, &last], 21 * 60_000, 41 * 60_000);
+        assert!(!h3.wait && h3.top.is_empty());
+        assert_eq!(wl_tag(JOB), "задача EwsPushJobService");
+        assert_eq!(wl_tag("*job*r/#SubscriptionUpdater$UpdateTask#@androidx.work.systemjobscheduler/com.example/x"), "задача SubscriptionUpdater$UpdateTask");
+        assert_eq!(wl_tag("*sync*/gmail-ls/com.google"), "синхронизация");
+        assert_eq!(wl_tag("Mail:WakeLock"), "Mail:WakeLock");
+    }
+
+    #[test]
+    fn no_sleep_names_app_holding_wakelock() {
+        let mut pk = BTreeMap::new();
+        pk.insert(10_330u32, vec!["com.example.mail".to_string()]);
+        // сон 20 %, Wi-Fi держит 30 с из каждой минуты = 20 мин за 40; почта — 30 мин
+        let mut v = Vec::new();
+        for i in 0..40 {
+            let mut x = b(i * 60_000, false, 0.2, 200);
+            x.ws.push(WsRec { n: "qcom_rx_wakelock".into(), ac: 100, wk: 100, ms: 30_000, pv: 30_000 });
+            v.push(x);
+        }
+        let now = 40 * 60_000;
+        let base = snap(30_000, 1, &[(10_330, JOB, 0)]);
+        let last = snap(now - 60_000, 1, &[(10_330, JOB, 30 * 60_000)]);
+        let mut w = Watch { dir: std::env::temp_dir(), defer: true, ..Watch::scratch() };
+        let a = w.eval_with(&refs(&v), Extra { snaps: &[&base, &last], vpn: None }, &cfg(), Some(5000.0), &pk, now);
+        let ns = a.iter().find(|a| a.rule == "no_sleep").expect("no_sleep");
+        assert!(ns.text.contains("не даёт спать com.example.mail: блокировка сна «задача EwsPushJobService» (30 мин 00 с)"), "{}", ns.text);
+        assert!(!ns.text.contains("qcom_rx_wakelock"), "{}", ns.text);
+        assert_eq!(ns.uid, Some(10_330));
+        assert_eq!(ns.pkg.as_deref(), Some("com.example.mail"));
+        assert!(!w.take_want_snap());
+
+        // почта держала меньше Wi-Fi — назвать обоих
+        let last2 = snap(now - 60_000, 1, &[(10_330, JOB, 5 * 60_000)]);
+        let mut w2 = Watch::scratch();
+        let a2 = w2.eval_with(&refs(&v), Extra { snaps: &[&base, &last2], vpn: None }, &cfg(), Some(5000.0), &pk, now);
+        let ns2 = a2.iter().find(|a| a.rule == "no_sleep").expect("no_sleep");
+        assert!(ns2.text.contains("«qcom_rx_wakelock» (20 мин 00 с)"), "{}", ns2.text);
+        assert!(ns2.text.contains("Из приложений дольше всех держит блокировку сна com.example.mail"), "{}", ns2.text);
+        assert_eq!(ns2.uid, Some(10_330));
+    }
+
+    #[test]
+    fn no_sleep_waits_for_fresh_snapshot() {
+        let mut pk = BTreeMap::new();
+        pk.insert(10_330u32, vec!["com.example.mail".to_string()]);
+        let mk_v = |n: i64| -> Vec<Bucket> { (0..n).map(|i| b(i * 60_000, false, 0.2, 200)).collect() };
+        let base = snap(30_000, 1, &[(10_330, JOB, 0)]);
+        let mut w = Watch { dir: std::env::temp_dir(), defer: true, ..Watch::scratch() };
+        // снимок только у начала — придержать и попросить свежий
+        let v = mk_v(40);
+        let a = w.eval_with(&refs(&v), Extra { snaps: &[&base], vpn: None }, &cfg(), Some(5000.0), &pk, 40 * 60_000);
+        assert!(a.iter().all(|a| a.rule != "no_sleep"));
+        assert!(w.take_want_snap());
+        // свежий снят — уходит с почтой
+        let v = mk_v(45);
+        let fresh = snap(41 * 60_000, 1, &[(10_330, JOB, 25 * 60_000)]);
+        let a = w.eval_with(&refs(&v), Extra { snaps: &[&base, &fresh], vpn: None }, &cfg(), Some(5000.0), &pk, 45 * 60_000);
+        let ns = a.iter().find(|a| a.rule == "no_sleep").expect("no_sleep");
+        assert!(ns.text.contains("com.example.mail"), "{}", ns.text);
+
+        // снимок так и не появился — через HOLD_WAIT_MS уходит без него
+        let mut w = Watch { dir: std::env::temp_dir(), defer: true, ..Watch::scratch() };
+        let v = mk_v(40);
+        assert!(w.eval_with(&refs(&v), Extra { snaps: &[&base], vpn: None }, &cfg(), Some(5000.0), &pk, 40 * 60_000).iter().all(|a| a.rule != "no_sleep"));
+        let v = mk_v(45);
+        assert!(w.eval_with(&refs(&v), Extra { snaps: &[&base], vpn: None }, &cfg(), Some(5000.0), &pk, 45 * 60_000).iter().all(|a| a.rule != "no_sleep"));
+        let n = 40 + HOLD_WAIT_MS / 60_000;
+        let v = mk_v(n);
+        let a = w.eval_with(&refs(&v), Extra { snaps: &[&base], vpn: None }, &cfg(), Some(5000.0), &pk, n * 60_000);
+        assert!(a.iter().any(|a| a.rule == "no_sleep"));
+    }
+
+    #[test]
+    fn wakeups_from_network_name_receiver() {
+        use crate::store::NetRec;
+        let mut pk = BTreeMap::new();
+        pk.insert(10_439u32, vec!["com.example.chat".to_string()]);
+        pk.insert(10_399u32, vec!["com.example.bank".to_string()]);
+        pk.insert(10_358u32, vec!["com.example.vpn".to_string()]);
+        let vpn: BTreeSet<String> = ["com.example.vpn".to_string()].into();
+        let nr = |u: u32, rp: u64| NetRec { u, rp, rb: rp * 600, ..Default::default() };
+        let mk_v = |net: Vec<Vec<NetRec>>| -> Vec<Bucket> {
+            (0..40)
+                .map(|i| {
+                    let mut x = b(i * 60_000, false, 0.9, 50);
+                    x.ws.push(WsRec { n: "qcom_rx_wakelock".into(), ac: 30, wk: 30, ms: 1_000, pv: 1_000 });
+                    if i % 10 == 9 {
+                        x.net = net[(i / 10) as usize].clone();
+                    }
+                    x
+                })
+                .collect()
+        };
+        // чат 700 пакетов из 1000 (туннель VPN — 900 — не в счёт), банк 250
+        let q = vec![nr(10_439, 175), nr(10_399, 62), nr(10_358, 225), nr(1051, 13)];
+        let v = mk_v(vec![q.clone(), q.clone(), q.clone(), q]);
+        let mut w = Watch::scratch();
+        let a = w.eval_with(&refs(&v), Extra { snaps: &[], vpn: Some(&vpn) }, &cfg(), Some(5000.0), &pk, 40 * 60_000);
+        let wk = a.iter().find(|a| a.rule == "wakeups").expect("wakeups");
+        assert!(wk.text.contains("Больше всех входящих пакетов получило com.example.chat: 70 % (~1050 в час"), "{}", wk.text);
+        assert!(wk.text.contains("Следом — com.example.bank: 25 %."), "{}", wk.text);
+        assert!(!wk.text.contains("com.example.vpn"), "{}", wk.text);
+        assert_eq!(wk.uid, Some(10_439));
+        assert_eq!(wk.pkg.as_deref(), Some("com.example.chat"));
+        assert_eq!(wk.key, "wakeups:qcom_rx_wakelock");
+
+        // пакеты размазаны — никого не называть
+        let flat: Vec<NetRec> = (0..6).map(|k| nr(10_400 + k, 50)).collect();
+        let v = mk_v(vec![flat.clone(), flat.clone(), flat.clone(), flat]);
+        let mut w = Watch::scratch();
+        let a = w.eval_with(&refs(&v), Extra { snaps: &[], vpn: Some(&vpn) }, &cfg(), Some(5000.0), &pk, 40 * 60_000);
+        let wk = a.iter().find(|a| a.rule == "wakeups").expect("wakeups");
+        assert!(!wk.text.contains("Больше всех входящих пакетов"), "{}", wk.text);
+        assert_eq!(wk.uid, None);
     }
 
     #[test]
